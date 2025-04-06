@@ -1,0 +1,50 @@
+ARG GO_VERSION=1.23
+FROM golang:${GO_VERSION}-bookworm AS tester
+
+WORKDIR /app
+
+# We need build-essential if any CGO is used during tests
+# Note: Removed curl as we no longer download the linter
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PATH="/go/bin:${PATH}"
+
+# Copy module files first for caching
+COPY go.mod go.sum* ./
+# Download dependencies based on module files
+RUN go mod download
+# Copy the rest of the source code
+COPY . .
+# Tidy modules *after* all source is present
+RUN go mod tidy
+
+# Install test dependencies if any (e.g., specific test tools)
+# RUN go install gotest.tools/gotestsum@latest
+
+# Environment variable to specify target platform for cross-testing (optional)
+ENV TARGET_PLATFORM=
+# CGO might still be needed for tests or dependencies
+ENV CGO_ENABLED=1
+
+# Command to run vet and tests
+# We can run all tests (unit + integration) inside the container
+CMD echo "Running vet and tests for platform: ${TARGET_PLATFORM:-native}"; \
+    # Run go vet first
+    echo "--- Running go vet ---"; \
+    go vet ./... ; \
+    # Run unit tests
+    echo "--- Running unit tests ---"; \
+    go test -v ./internal/... ./pkg/... ; \
+    # Run integration tests (might need specific setup depending on test needs)
+    echo "--- Running integration tests ---"; \
+    go test -v ./tests/integration/...
+
+
+# --- Notes ---
+# - This image is built independently by 'make buildx-test-image'.
+# - The 'docker run' command in the Makefile should handle platform specifics if needed.
+# - For integration tests needing external resources (like specific filesystems or devices),
+#   this simple setup might be insufficient. You might need to mount volumes or use
+#   more complex Docker configurations (e.g., docker-compose).
