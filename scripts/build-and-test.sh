@@ -8,6 +8,13 @@ TOTAL_TIMEOUT_MINUTES=30
 START_TIME=$(date +%s)
 PLATFORMS="linux/amd64 linux/arm64 windows/amd64 darwin/amd64 darwin/arm64"
 
+# Check if we should build with the race detector
+RACE_FLAG=""
+if [ "${DEBUG:-0}" = "1" ]; then
+    echo "DEBUG=1 detected, building with -race flag enabled"
+    RACE_FLAG="-race"
+fi
+
 # Function to check overall timeout
 check_total_timeout() {
     local current_time=$(date +%s)
@@ -36,12 +43,18 @@ build_for_platform() {
     # Common Docker parameters - we use linux/amd64 Docker container to cross-compile for all platforms
     local output_file="rebalance-${os}-${arch}"
     local docker_args="-v $(pwd):/app -w /app golang:1.23"
-    local build_cmd="go build -o bin/${os}_${arch}/${output_file}"
+    local build_cmd="go build ${RACE_FLAG} -o bin/${os}_${arch}/${output_file}"
+
+    # Add debug suffix if building with race detector
+    if [ -n "${RACE_FLAG}" ]; then
+        output_file="${output_file}-debug"
+        build_cmd="go build ${RACE_FLAG} -o bin/${os}_${arch}/${output_file}"
+    fi
 
     # Add .exe extension for Windows
     if [ "$os" = "windows" ]; then
         output_file="${output_file}.exe"
-        build_cmd="go build -o bin/${os}_${arch}/${output_file}"
+        build_cmd="go build ${RACE_FLAG} -o bin/${os}_${arch}/${output_file}"
     fi
     
     echo "Building ${platform} binary via Docker (using linux/amd64 build container)..."
@@ -63,9 +76,17 @@ build_for_platform() {
     
     # Create symlink for convenience
     if [ "$os" = "windows" ]; then
-        ln -sf "${output_file}" "bin/${os}_${arch}/rebalance.exe"
+        if [ -n "${RACE_FLAG}" ]; then
+            ln -sf "${output_file}" "bin/${os}_${arch}/rebalance-debug.exe"
+        else
+            ln -sf "${output_file}" "bin/${os}_${arch}/rebalance.exe"
+        fi
     else
-        ln -sf "${output_file}" "bin/${os}_${arch}/rebalance"
+        if [ -n "${RACE_FLAG}" ]; then
+            ln -sf "${output_file}" "bin/${os}_${arch}/rebalance-debug"
+        else
+            ln -sf "${output_file}" "bin/${os}_${arch}/rebalance"
+        fi
     fi
     
     echo "Build completed for ${platform}"

@@ -10,6 +10,8 @@ A high-performance utility for reducing ZFS fragmentation by copying files in-pl
 
 go-zfs-rebalance is designed to help mitigate ZFS fragmentation issues by intelligently rebalancing files. The tool copies files in-place, which forces ZFS to allocate new blocks in the most optimal pattern available, helping to improve read and write performance on fragmented pools. It works on any system with ZFS, including TrueNAS Scale.
 
+It now supports multiple passes in sequence, continuing through all configured passes even when some files fail to rebalance, and includes a reasonable maximum concurrency limit of 128 to prevent resource exhaustion.
+
 ## Problem & Solution
 
 When expanding a ZFS pool with additional storage devices, existing data remains on the original vdevs, creating an imbalanced distribution. This imbalance can significantly impact I/O performance, as the new devices remain underutilized while original devices continue to handle most of the workload.
@@ -27,9 +29,9 @@ The result is more consistent performance and better utilization of your entire 
 
 - **In-place file rebalancing**: Creates fresh copies of files to improve ZFS block allocation
 - **Data integrity**: Verifies all files with SHA256 checksums (or MD5 if specified) to ensure perfect copies
-- **Multi-pass capability**: Supports multiple rebalancing passes for heavily fragmented filesystems
+- **Enhanced multi-pass capability**: Supports multiple rebalancing passes for heavily fragmented filesystems, continuing through all passes even when some files fail
 - **Attribute preservation**: Maintains file permissions, timestamps, and ownership
-- **Concurrent processing**: Multi-threaded design for high-performance operation
+- **Concurrent processing**: Multi-threaded design for high-performance operation (up to 128 concurrent jobs)
 - **Graceful shutdown**: Safely handles interruptions with CTRL+C (finishes in-progress files)
 - **Smart logging**: Configurable output verbosity with size-based filtering
 - **Randomized processing**: Default randomized file handling for better I/O distribution
@@ -131,7 +133,7 @@ rebalance [options] <path>
 |--------|-------------|---------|
 | `--process-hardlinks` | Process files with multiple hardlinks (potentially increasing space usage) | Disabled |
 | `--passes X` | Number of times a file may be rebalanced | 10 (0 = unlimited) |
-| `--concurrency X` | Number of files to process concurrently | auto (half of CPU cores, minimum 2) |
+| `--concurrency X` | Number of files to process concurrently | auto (half of CPU cores, minimum 2, maximum 128) |
 | `--no-cleanup-balance` | Disable automatic removal of stale .balance files | Enabled |
 | `--no-random` | Process files in directory order instead of random | Random enabled |
 | `--checksum TYPE` | Checksum type to use (sha256 or md5) | sha256 |
@@ -216,6 +218,7 @@ This project was inspired by the functionality of the original [zfs-inplace-reba
 
 *   **Concurrency**: Utilizes Go routines and a `--concurrency` flag for parallel file processing, significantly speeding up operations on multi-core systems compared to the sequential nature of the bash script.
 *   **Robust State Management**: Employs a persistent SQLite database to track file processing status and rebalance passes, offering better reliability and lookup performance than the script's text file (`rebalance_db.txt`).
+*   **Resilient Multi-Pass Processing**: Intelligently continues through all configured passes even when some files fail to rebalance, with a reasonable concurrency limit (128) to prevent resource exhaustion.
 *   **Graceful Shutdown & Error Handling**: Implements signal handling (CTRL+C) for graceful shutdowns, attempting to complete in-progress file operations and providing a timeout mechanism. This contrasts with the potential need for manual cleanup of `.balance` files if the bash script is interrupted.
 *   **Automatic Cleanup**: Includes built-in logic (toggleable via `--no-cleanup-balance`) to automatically remove stale `.balance` files left over from previous runs or interruptions, improving robustness.
 *   **Dependencies & Portability**: Compiles into a single, self-contained binary without external runtime dependencies (like `perl`, required by the bash script). This simplifies deployment across different Linux distributions and potentially other OSes.

@@ -19,8 +19,8 @@ import (
 )
 
 // Version information
-const (
-	VERSION = "1.0.0"
+var (
+	VERSION = "1.0.1"
 )
 
 // ANSI color codes
@@ -217,7 +217,7 @@ func printUsage() {
 	fmt.Println("Options:")
 	fmt.Println("  --process-hardlinks  Process files with multiple hardlinks (skipped by default)")
 	fmt.Println("  --passes X           Number of times a file may be rebalanced (default: 10, 0 for unlimited)")
-	fmt.Println("  --concurrency X      Number of files to process concurrently (default: auto - half of CPU cores, minimum 2)")
+	fmt.Println("  --concurrency X      Number of files to process concurrently (default: auto - half of CPU cores, minimum 2, maximum 128)")
 	fmt.Println("  --no-cleanup-balance Disable automatic removal of stale .balance files (enabled by default)")
 	fmt.Println("  --no-random          Process files in directory order instead of random order (default)")
 	fmt.Println("  --debug              Enable debug logging (shows all operations, not just successes/errors)")
@@ -262,7 +262,13 @@ func printUsage() {
 // concurrencyStr returns a string representation of the concurrency setting
 func concurrencyStr(concurrency int) string {
 	if concurrency <= 0 {
-		return "auto"
+		// For auto concurrency, calculate and include the actual worker count
+		cpuCount := runtime.NumCPU()
+		autoConcurrency := cpuCount / 2
+		if autoConcurrency < 2 {
+			autoConcurrency = 2
+		}
+		return fmt.Sprintf("auto (%d workers based on %d CPUs)", autoConcurrency, cpuCount)
 	}
 	return fmt.Sprintf("%d", concurrency)
 }
@@ -270,7 +276,14 @@ func concurrencyStr(concurrency int) string {
 // calculateConcurrency determines the number of worker threads to use
 // If auto is specified (concurrency <= 0), it uses half the number of CPU cores with a minimum of 2
 func calculateConcurrency(concurrency int) int {
+	// Set a maximum concurrency to prevent resource exhaustion
+	const maxConcurrency = 128
+
 	if concurrency > 0 {
+		// Apply the maximum limit
+		if concurrency > maxConcurrency {
+			return maxConcurrency
+		}
 		return concurrency
 	}
 
@@ -279,6 +292,10 @@ func calculateConcurrency(concurrency int) int {
 	autoConcurrency := cpuCount / 2
 	if autoConcurrency < 2 {
 		autoConcurrency = 2
+	}
+	// Also apply max limit to auto-calculated concurrency
+	if autoConcurrency > maxConcurrency {
+		autoConcurrency = maxConcurrency
 	}
 	return autoConcurrency
 }
@@ -310,7 +327,7 @@ func main() {
 
 	flag.BoolVar(&processHardlinks, "process-hardlinks", false, "Process files with multiple hardlinks")
 	flag.IntVar(&passesFlag, "passes", 10, "Number of times a file may be rebalanced (0 for unlimited)")
-	flag.IntVar(&concurrency, "concurrency", 0, "Number of files to process concurrently (default: auto - half of CPU cores, minimum 2)")
+	flag.IntVar(&concurrency, "concurrency", 0, "Number of files to process concurrently (default: auto - half of CPU cores, minimum 2, maximum 128)")
 	flag.BoolVar(&showHelp, "help", false, "Show usage")
 	flag.BoolVar(&noCleanupBalance, "no-cleanup-balance", false, "Disable automatic removal of stale .balance files")
 	flag.BoolVar(&noRandomOrder, "no-random", false, "Process files in directory order instead of random order")
@@ -384,11 +401,6 @@ func main() {
 	// Calculate the actual concurrency to use
 	actualConcurrency := calculateConcurrency(concurrency)
 
-	// If auto concurrency was used, log the actual number of workers
-	if concurrency <= 0 {
-		log.Infof("Auto concurrency selected: using %d workers based on %d CPUs", actualConcurrency, runtime.NumCPU())
-	}
-
 	config := &rebalance.Config{
 		SkipHardlinks:       !processHardlinks,
 		PassesLimit:         passesFlag,
@@ -428,9 +440,6 @@ func main() {
 			close(done)
 		}()
 	}()
-
-	// Create a channel for rebalancer completion
-	rebalanceDone := make(chan struct{})
 
 	// Create a shared progress tracker
 	progressChan := make(chan int, 100)
@@ -475,6 +484,7 @@ func main() {
 	printProgress()
 
 	// Start a periodic progress reporter
+	progressReporter := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
@@ -487,34 +497,86 @@ func main() {
 			case count := <-progressChan:
 				processedFiles = count
 
-			case <-rebalanceDone:
+			case <-progressReporter:
 				return
 			}
 		}
 	}()
 
-	// Run the rebalancer in a goroutine
-	go func() {
-		err = rebalancer.Run(progressChan)
-		close(rebalanceDone)
-	}()
+	// Track if any passes had failures
+	overallFailure := false
 
-	// Wait for either rebalancer to finish or a forced exit
-	select {
-	case <-rebalanceDone:
-		// Normal completion - print final progress
+	// Run all passes in sequence
+	for pass := currentPass; pass <= totalPasses; pass++ {
+		// Reset for the new pass
+		processedFiles = 0
+
+		// Get updated file list (some may have reached pass limit)
+		files, err = rebalancer.GetFiles()
+		if err != nil {
+			log.Errorf("Error getting file list for pass %d: %v", pass, err)
+			overallFailure = true
+			break
+		}
+
+		totalFiles = len(files)
+		if totalFiles == 0 {
+			log.Infof("No files to process in pass %d.", pass)
+			break
+		}
+
+		// Get updated pass info
+		currentPass, _ = rebalancer.GetPassInfo()
+
+		// Skip iteration if we've moved beyond our intended pass
+		// (could happen if another process has incremented file counts)
+		if currentPass > pass {
+			continue
+		}
+
+		// Show progress update with new pass info
 		printProgress()
 
-		// Show completion message
-		if err != nil {
-			log.Error(err)
+		// Run the current pass
+		log.Infof("Starting pass %d of %d with %d files", currentPass, totalPasses, totalFiles)
+
+		// Run the rebalancer in a goroutine
+		passDone := make(chan struct{})
+		go func() {
+			err = rebalancer.Run(progressChan)
+			close(passDone)
+		}()
+
+		// Wait for either rebalancer to finish or a forced exit
+		select {
+		case <-passDone:
+			// Normal completion - print final progress for this pass
+			printProgress()
+
+			// Check for errors in this pass
+			if err != nil {
+				log.Warnf("Pass %d completed with some failures: %v", currentPass, err)
+				overallFailure = true
+			} else {
+				log.Infof("Pass %d completed successfully", currentPass)
+			}
+
+		case <-done:
+			// Forced exit due to timeout
+			close(progressReporter)
+			log.Error("Forced exit: rebalance operation did not complete gracefully in time")
 			os.Exit(1)
-		} else {
-			log.Info("All files processed successfully.")
 		}
-	case <-done:
-		// Forced exit due to timeout
-		log.Error("Forced exit: rebalance operation did not complete gracefully in time")
+	}
+
+	// Stop the progress reporter
+	close(progressReporter)
+
+	// Show completion message
+	if overallFailure {
+		log.Error("Some files failed to rebalance during one or more passes")
 		os.Exit(1)
+	} else {
+		log.Info("All passes completed successfully")
 	}
 }

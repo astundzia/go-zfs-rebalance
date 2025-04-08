@@ -39,3 +39,4 @@ Thumbs.db
 *.log
 *.txt
 /rebalance
+/zfs-rebalance
