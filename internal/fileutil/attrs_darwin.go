@@ -11,7 +11,10 @@ import (
 // openNoATime is zero: macOS can't open a file without updating its access time.
 const openNoATime = 0
 
-const immutableHint = "chflags uchg / uappnd"
+const (
+	immutableHint   = "chflags uchg / uappnd"
+	undeletableHint = "a macOS system flag"
+)
 
 // fileAttrs holds a macOS file's chflags flags. They are only used to refuse files that can't be
 // replaced; the other flags (such as hidden) are not copied.
@@ -26,11 +29,14 @@ func readFileAttrs(f *os.File) (fileAttrs, error) {
 	return fileAttrs{flags: st.Flags}, nil
 }
 
-// protected returns an ErrImmutable error if the original is marked immutable, append-only or
-// undeletable, which stops a rename over it even for root.
+// protected returns an ErrImmutable error if the original is marked immutable or append-only, or
+// an ErrUndeletable one if it is marked undeletable; each stops a rename over it, even for root.
 func (a fileAttrs) protected() error {
-	if a.flags&(unix.UF_IMMUTABLE|unix.SF_IMMUTABLE|unix.UF_APPEND|unix.SF_APPEND|unix.SF_NOUNLINK) != 0 {
+	switch {
+	case a.flags&(unix.UF_IMMUTABLE|unix.SF_IMMUTABLE|unix.UF_APPEND|unix.SF_APPEND) != 0:
 		return failKind(ErrImmutable, "", nil)
+	case a.flags&unix.SF_NOUNLINK != 0:
+		return failKind(ErrUndeletable, "", nil)
 	}
 	return nil
 }
@@ -41,4 +47,4 @@ func applyFileAttrs(*os.File, fileAttrs) error { return nil }
 
 func diffFileAttrs(*os.File, fileAttrs) (string, error) { return "", nil }
 
-func afterSwap(int, fileAttrs) {}
+func afterSwap(*os.File, fileAttrs) {}

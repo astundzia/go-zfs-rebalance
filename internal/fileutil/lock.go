@@ -25,26 +25,36 @@ func flockNB(fd int) error {
 	}
 }
 
-// lockTemp locks the new temporary file f and returns the descriptor holding the lock, or -1 if it
-// couldn't be locked. The lock is held through a duplicate of f's descriptor, so f can be closed
-// (and its close error checked) before the swap while the lock lasts until the temporary names are
-// gone. Hardlinks made to the file later share its lock. Locking is a courtesy to other runs (see
-// RemoveStaleTemp), so a failure to lock doesn't stop the rewrite.
-func lockTemp(f *os.File) int {
-	lockFd := -1
+// lockTemp returns a duplicate of the new temporary file f's descriptor, locked where the
+// filesystem has locks, or nil if f's descriptor couldn't be duplicated. The duplicate lets f be
+// closed (and its close error checked) before the swap while the lock lasts until the temporary
+// names are gone, and lets the new file's times be put right after the swap (see keepTimes).
+// Hardlinks made to the file later share its lock. Locking is a courtesy to other runs (see
+// RemoveStaleTemp), so a filesystem without locks doesn't stop the rewrite.
+func lockTemp(f *os.File) *os.File {
+	var held *os.File
 	_ = withFd(f, func(fd int) error {
 		dup, err := unix.FcntlInt(uintptr(fd), unix.F_DUPFD_CLOEXEC, 0)
 		if err != nil {
 			return err
 		}
-		if err := flockNB(dup); err != nil {
-			_ = unix.Close(dup)
-			return err
-		}
-		lockFd = dup
+		_ = flockNB(dup)
+		held = os.NewFile(uintptr(dup), f.Name())
 		return nil
 	})
-	return lockFd
+	return held
+}
+
+// lockSource locks the original, open as src, for as long as it stays open, so two runs (or a run
+// and another program that locks the files it works on) never work on the same file at once. A
+// file someone else has locked gives ErrBusy. A filesystem without locks (or one, like NFS, that
+// only locks files open for writing) doesn't stop the rewrite: the final checks before the swap
+// still catch any change.
+func lockSource(src *os.File) error {
+	if err := withFd(src, flockNB); errors.Is(err, unix.EWOULDBLOCK) {
+		return failKind(ErrBusy, "", nil)
+	}
+	return nil
 }
 
 // RemoveStaleTemp removes rel, one of the temporary files ReplaceInPlace and ReplaceGroup create,

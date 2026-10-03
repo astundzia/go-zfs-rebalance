@@ -184,8 +184,8 @@ func getFsx(t *testing.T, name string) (fsxattr, bool) {
 	return fsx, ok
 }
 
-// setProject sets name's project ID (and, if inherit, project inheritance), skipping the test if
-// the filesystem has no project quotas.
+// setProject sets name's project ID (and, if inherit, project inheritance, as chattr +P does),
+// skipping the test if the filesystem has no project quotas.
 func setProject(t *testing.T, name string, projid uint32, inherit bool) {
 	t.Helper()
 	err := withFile(t, name, func(fd int) error {
@@ -194,10 +194,31 @@ func setProject(t *testing.T, name string, projid uint32, inherit bool) {
 			return err
 		}
 		fsx.projid = projid
-		if inherit {
-			fsx.xflags |= 0x200 // FS_XFLAG_PROJINHERIT
+		if err := ioctlPtr(fd, fsIocFSSetXattr, unsafe.Pointer(&fsx)); err != nil || !inherit {
+			return err
 		}
-		return ioctlPtr(fd, fsIocFSSetXattr, unsafe.Pointer(&fsx))
+		// ZFS and ext4 take project inheritance as an inode flag (OpenZFS 2.2 refuses
+		// FS_XFLAG_PROJINHERIT in FS_IOC_FSSETXATTR); XFS only as the extended flag.
+		flags, err := unix.IoctlGetUint32(fd, unix.FS_IOC_GETFLAGS)
+		if err == nil {
+			err = unix.IoctlSetPointerInt(fd, unix.FS_IOC_SETFLAGS, int(flags|fsProjinheritFl))
+		}
+		if err != nil {
+			if err := ioctlPtr(fd, fsIocFSGetXattr, unsafe.Pointer(&fsx)); err != nil {
+				return err
+			}
+			fsx.xflags |= 0x200 // FS_XFLAG_PROJINHERIT
+			if err := ioctlPtr(fd, fsIocFSSetXattr, unsafe.Pointer(&fsx)); err != nil {
+				return err
+			}
+		}
+		if err := ioctlPtr(fd, fsIocFSGetXattr, unsafe.Pointer(&fsx)); err != nil {
+			return err
+		}
+		if fsx.xflags&projInheritX == 0 || fsx.projid != projid {
+			return fmt.Errorf("project inheritance didn't stick (xflags %#x, project %d)", fsx.xflags, fsx.projid)
+		}
+		return nil
 	})
 	if err != nil {
 		t.Skipf("can't set a project ID here (needs project quotas, for example ZFS with %s set): %v", testDirEnv, err)
@@ -238,8 +259,9 @@ func TestReplaceInPlaceRootRefusesProjectIDItsFolderWontTake(t *testing.T) {
 	before := mustLstat(t, root, "proj/f")
 
 	_, err := ReplaceInPlace(context.Background(), root, "proj/f", Options{})
+	require.ErrorIs(t, err, ErrProjectID)
 	require.ErrorIs(t, err, ErrMetadata)
-	require.Contains(t, err.Error(), "its project ID is different from its folder's")
+	require.Equal(t, ErrProjectID.Error(), err.Error())
 	requireUntouched(t, root, "proj/f", before)
 	requireNoTemps(t, dir)
 	fsx, _ := getFsx(t, name)
@@ -416,8 +438,40 @@ func TestReplaceInPlaceRootRefusesZFSNounlink(t *testing.T) {
 	before := mustLstat(t, root, "f")
 
 	_, err := ReplaceInPlace(context.Background(), root, "f", Options{})
-	require.ErrorIs(t, err, ErrImmutable)
+	require.ErrorIs(t, err, ErrUndeletable)
 	require.Equal(t, "it's protected from being deleted (the ZFS nounlink attribute), so it was left alone — nothing was changed", err.Error())
 	requireUntouched(t, root, "f", before)
 	requireNoTemps(t, dir)
+}
+
+// Each kind of protection is reported as what it is, so the run's summary can count it correctly.
+func TestProtectedKinds(t *testing.T) {
+	tests := []struct {
+		name  string
+		attrs fileAttrs
+		want  error // nil: not protected
+		not   error
+	}{
+		{"plain", fileAttrs{hasFlags: true, flags: fsNodumpFl, hasDOS: true, dos: zfsArchive | zfsHidden}, nil, nil},
+		{"immutable", fileAttrs{hasFlags: true, flags: fsImmutableFl}, ErrImmutable, ErrUndeletable},
+		{"append-only", fileAttrs{hasFlags: true, flags: fsAppendFl}, ErrImmutable, ErrUndeletable},
+		{"ZFS immutable", fileAttrs{hasDOS: true, dos: zfsImmutable}, ErrImmutable, ErrUndeletable},
+		{"ZFS append-only", fileAttrs{hasDOS: true, dos: zfsAppendonly}, ErrImmutable, ErrUndeletable},
+		{"ZFS nounlink", fileAttrs{hasDOS: true, dos: zfsNounlink}, ErrUndeletable, nil},
+		{"flags not reported", fileAttrs{flags: fsImmutableFl, dos: zfsNounlink}, nil, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.attrs.protected()
+			if tt.want == nil {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorIs(t, err, tt.want)
+			require.ErrorIs(t, err, ErrImmutable)
+			if tt.not != nil {
+				require.NotErrorIs(t, err, tt.not)
+			}
+		})
+	}
 }

@@ -20,23 +20,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// testDirEnv names a directory to run the rewrite tests in instead of the system's temporary
-// directory, for example a folder on a ZFS dataset, so that ZFS-only behaviour (DOS attributes,
-// NFSv4 ACLs, project IDs) is tested too.
-const testDirEnv = "REBALANCE_TEST_DIR"
-
 // newRoot returns a fresh directory and an os.Root opened on it.
 func newRoot(t *testing.T) (string, *os.Root) {
 	t.Helper()
-	var dir string
-	if base := os.Getenv(testDirEnv); base != "" {
-		var err error
-		dir, err = os.MkdirTemp(base, "fileutil-test-")
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	} else {
-		dir = t.TempDir()
-	}
+	dir := testDir(t)
 	root, err := os.OpenRoot(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = root.Close() })
@@ -204,6 +191,9 @@ func TestReplaceInPlaceKeepsMode(t *testing.T) {
 			dir, root := newRoot(t)
 			name := filepath.Join(dir, "f")
 			require.NoError(t, os.WriteFile(name, []byte("#!/bin/sh\n"), 0o600))
+			// A new file may take its folder's group (always on macOS), and only a member of the
+			// file's group may set setgid on it.
+			require.NoError(t, os.Chown(name, -1, os.Getegid()))
 			require.NoError(t, os.Chmod(name, mode))
 			before := mustLstat(t, root, "f")
 			require.Equal(t, mode, before.Mode.Perm()|before.Mode&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky),
@@ -242,8 +232,9 @@ func TestReplaceInPlaceKeepsGroup(t *testing.T) {
 	if other < 0 {
 		t.Skip("no other group to move the file to")
 	}
-	require.NoError(t, os.Chmod(name, 0o2750)) // chgrp may clear setgid, so set it afterwards
+	require.NoError(t, os.Chmod(name, 0o750|os.ModeSetgid)) // chgrp may clear setgid, so set it afterwards
 	before = mustLstat(t, root, "f")
+	require.NotZero(t, before.Mode&os.ModeSetgid, "setting up the original")
 
 	_, err = ReplaceInPlace(context.Background(), root, "f", Options{})
 	require.NoError(t, err)
@@ -555,7 +546,7 @@ func TestReplaceInPlaceMissingFile(t *testing.T) {
 }
 
 func TestReplaceInPlaceStaysInsideRoot(t *testing.T) {
-	outside := t.TempDir()
+	outside := testDir(t)
 	require.NoError(t, os.WriteFile(filepath.Join(outside, "f"), []byte("outside"), 0o644))
 	dir, root := newRoot(t)
 	require.NoError(t, os.Symlink(outside, filepath.Join(dir, "escape")))
@@ -753,6 +744,7 @@ func TestReplaceGroupStoppedPartWay(t *testing.T) {
 	require.ErrorIs(t, err, fs.ErrPermission)
 	require.Equal(t, "couldn't link the new copy to the file's other names (permission denied) — "+
 		"1 of its 3 hardlinked names was switched to the new, identical copy; the others still use the original", err.Error())
+	require.True(t, LeftSplit(err), "a part-switched group must be reported as split")
 
 	b := mustLstat(t, root, "sub/b")
 	require.NotEqual(t, before.ID, b.ID, "sub/b was switched first")

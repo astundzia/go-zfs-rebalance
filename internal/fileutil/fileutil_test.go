@@ -15,6 +15,25 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// testDirEnv names a directory to run the rewrite tests in instead of the system's temporary
+// directory, for example a folder on a ZFS dataset, so that ZFS-only behaviour (DOS attributes,
+// NFSv4 ACLs, project IDs) is tested too.
+const testDirEnv = "REBALANCE_TEST_DIR"
+
+// testDir returns a fresh directory in the one named by testDirEnv, or else in the system's
+// temporary directory, removed when the test ends.
+func testDir(t *testing.T) string {
+	t.Helper()
+	base := os.Getenv(testDirEnv)
+	if base == "" {
+		return t.TempDir()
+	}
+	dir, err := os.MkdirTemp(base, "fileutil-test-")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
 func TestIsTempName(t *testing.T) {
 	tests := []struct {
 		name string
@@ -76,7 +95,7 @@ func TestParseChecksumType(t *testing.T) {
 // The copy loop must never reach copy_file_range or sendfile (which would clone blocks instead of
 // rewriting them), so the types it reads and writes through must not offer the io fast paths.
 func TestCopyTypesHideFastPaths(t *testing.T) {
-	f, err := os.Create(filepath.Join(t.TempDir(), "f"))
+	f, err := os.Create(filepath.Join(testDir(t), "f"))
 	require.NoError(t, err)
 	defer f.Close()
 
@@ -109,7 +128,7 @@ func TestCopyData(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dir := t.TempDir()
+			dir := testDir(t)
 			src := writeTestFile(t, filepath.Join(dir, "src"), tt.content)
 			dst, err := os.Create(filepath.Join(dir, "dst"))
 			require.NoError(t, err)
@@ -131,7 +150,7 @@ func TestCopyData(t *testing.T) {
 }
 
 func TestCopyDataStopsWhenSourceGrows(t *testing.T) {
-	dir := t.TempDir()
+	dir := testDir(t)
 	src := writeTestFile(t, filepath.Join(dir, "src"), bytes.Repeat([]byte("x"), 100))
 	dst, err := os.Create(filepath.Join(dir, "dst"))
 	require.NoError(t, err)
@@ -143,7 +162,7 @@ func TestCopyDataStopsWhenSourceGrows(t *testing.T) {
 
 func TestVerifyCopyDetectsMismatch(t *testing.T) {
 	content := []byte("hello, world")
-	f := writeTestFile(t, filepath.Join(t.TempDir(), "f"), content)
+	f := writeTestFile(t, filepath.Join(testDir(t), "f"), content)
 	sum := sha256.Sum256(content)
 	buf := make([]byte, 4)
 
@@ -158,11 +177,24 @@ func TestVerifyCopyDetectsMismatch(t *testing.T) {
 }
 
 func TestErrorMessages(t *testing.T) {
-	require.Equal(t, "couldn't keep the file's owner (try running with sudo) — nothing was changed", ErrOwnership.Error())
+	require.Equal(t, "couldn't keep the file's owner or group — nothing was changed", ErrOwnership.Error())
+	require.Equal(t, "another program or another rebalance run is working on it, so it was left alone — nothing was changed", ErrBusy.Error())
 
-	for _, sentinel := range []error{ErrModified, ErrNoSpace, ErrOwnership, ErrMetadata, ErrChecksum,
-		ErrNotRegular, ErrLinkMismatch, ErrImmutable, ErrUnsupportedPlatform} {
+	for _, sentinel := range []error{ErrModified, ErrNoSpace, ErrOwnership, ErrMetadata, ErrProjectID, ErrChecksum,
+		ErrNotRegular, ErrLinkMismatch, ErrImmutable, ErrUndeletable, ErrBusy, ErrUnsupportedPlatform} {
 		require.Regexp(t, `^[a-z].* — nothing was changed$`, sentinel.Error())
+	}
+	// The more specific kinds also match the broader ones, but not the other way round.
+	require.ErrorIs(t, ErrProjectID, ErrMetadata)
+	require.ErrorIs(t, ErrUndeletable, ErrImmutable)
+	require.NotErrorIs(t, ErrMetadata, ErrProjectID)
+	require.NotErrorIs(t, ErrImmutable, ErrUndeletable)
+	require.NotErrorIs(t, ErrBusy, ErrModified)
+
+	// Only root can give a file away, so only a run without root is told to try sudo.
+	ownerMessage := "couldn't keep the file's owner or group (try running with sudo) — nothing was changed"
+	if os.Geteuid() == 0 {
+		ownerMessage = "couldn't keep the file's owner or group (the filesystem refused, even for root: operation not permitted) — nothing was changed"
 	}
 
 	pathErr := func(errno syscall.Errno) error {
@@ -175,6 +207,7 @@ func TestErrorMessages(t *testing.T) {
 		is      []error
 		isNot   []error
 		message string
+		split   bool
 	}{
 		{
 			name:    "no space",
@@ -216,7 +249,19 @@ func TestErrorMessages(t *testing.T) {
 			err:     ownershipErr(&os.SyscallError{Syscall: "fchown", Err: syscall.EPERM}),
 			is:      []error{ErrOwnership, syscall.EPERM},
 			isNot:   []error{ErrNoSpace},
-			message: "couldn't keep the file's owner (try running with sudo) — nothing was changed",
+			message: ownerMessage,
+		},
+		{
+			name:    "project ID its folder won't take",
+			err:     failKind(ErrProjectID, "", &os.LinkError{Op: "renameat", Old: "a", New: "b", Err: syscall.EXDEV}),
+			is:      []error{ErrProjectID, ErrMetadata, syscall.EXDEV},
+			message: "its project ID (used for quotas) is different from its folder's, and that folder only accepts files with its own, so it was left alone — nothing was changed",
+		},
+		{
+			name:    "undeletable",
+			err:     failKind(ErrUndeletable, "", nil),
+			is:      []error{ErrUndeletable, ErrImmutable},
+			message: "it's protected from being deleted (" + undeletableHint + "), so it was left alone — nothing was changed",
 		},
 		{
 			name:    "own wording for a kind",
@@ -234,7 +279,7 @@ func TestErrorMessages(t *testing.T) {
 			name:    "ownership",
 			err:     failKind(ErrOwnership, "", pathErr(syscall.EPERM)),
 			is:      []error{ErrOwnership, syscall.EPERM},
-			message: "couldn't keep the file's owner (try running with sudo) — nothing was changed",
+			message: "couldn't keep the file's owner or group — nothing was changed",
 		},
 		{
 			name:    "cancelled",
@@ -252,12 +297,14 @@ func TestErrorMessages(t *testing.T) {
 			name:    "hardlink group stopped part-way",
 			err:     &failure{kind: ErrModified.(*sentinel), swapped: 2, names: 3},
 			is:      []error{ErrModified},
+			split:   true,
 			message: "the file changed while it was being copied — 2 of its 3 hardlinked names were switched to the new, identical copy; the others still use the original",
 		},
 		{
 			name:    "hardlink group stopped after one name",
 			err:     &failure{kind: ErrLinkMismatch.(*sentinel), swapped: 1, names: 4},
 			is:      []error{ErrLinkMismatch},
+			split:   true,
 			message: "the file's hardlinks don't match what was expected — 1 of its 4 hardlinked names was switched to the new, identical copy; the others still use the original",
 		},
 	}
@@ -270,6 +317,7 @@ func TestErrorMessages(t *testing.T) {
 				require.NotErrorIs(t, tt.err, target)
 			}
 			require.Equal(t, tt.message, tt.err.Error())
+			require.Equal(t, tt.split, LeftSplit(tt.err), "LeftSplit")
 		})
 	}
 }

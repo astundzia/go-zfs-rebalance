@@ -104,10 +104,11 @@ func prepareTemp(root *os.Root, names []string, tmp *os.File, orig Info, want wa
 // finishTemp is the second half of copying the metadata, done once the data is written and
 // verified: the remaining extended attributes (including file capabilities, which a write would
 // clear), the full mode with setuid and setgid, chattr flags, ZFS DOS attributes and, last of all,
-// the timestamps, which every other step can change. A macOS ACL is set after the timestamps so
-// a "deny" entry can't block the steps before it; setting it leaves them alone. The result is then
-// checked against the original.
-func finishTemp(root *os.Root, tmp *os.File, tmpRel string, orig Info, want wantedMeta) error {
+// the timestamps, which every other step can change. Every step works on the open copy, never on
+// its name, which someone who can write to the folder could swap for a symlink. A macOS ACL is set
+// after the timestamps so a "deny" entry can't block the steps before it; setting it leaves them
+// alone. The result is then checked against the original.
+func finishTemp(tmp *os.File, orig Info, want wantedMeta) error {
 	// The ACL goes after the other attributes: it can take away the write permission they need.
 	for _, pick := range []func(string) bool{isOtherXattr, isACLXattr} {
 		if err := applyXattrs(tmp, want.xattrs, pick); err != nil {
@@ -121,7 +122,7 @@ func finishTemp(root *os.Root, tmp *os.File, tmpRel string, orig Info, want want
 	}
 	// setuid and setgid are only ever set on a copy that belongs to the original's owner.
 	if cur.UID != orig.UID || cur.GID != orig.GID {
-		return failKind(ErrOwnership, "", nil)
+		return ownershipErr(nil)
 	}
 	if cur.Mode != orig.Mode {
 		if err := tmp.Chmod(orig.Mode & permBits); err != nil {
@@ -133,10 +134,7 @@ func finishTemp(root *os.Root, tmp *os.File, tmpRel string, orig Info, want want
 		return err
 	}
 
-	if err := root.Chtimes(tmpRel, orig.Atime, orig.Mtime); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return failKind(ErrModified, tempGone, err)
-		}
+	if err := SetTimes(tmp, orig.Atime, orig.Mtime); err != nil {
 		return failKind(ErrMetadata, "timestamps: "+reason(err), err)
 	}
 
@@ -144,6 +142,25 @@ func finishTemp(root *os.Root, tmp *os.File, tmpRel string, orig Info, want want
 		return err
 	}
 	return verifyMetadata(tmp, orig, want)
+}
+
+// timeAttempts bounds how often keepTimes puts the times back while something keeps reading the file.
+const timeAttempts = 3
+
+// keepTimes gives the new file f the original's access and modified times again if only its access
+// time changed after finishTemp set them, as reading the hidden copy before the swap does. A changed
+// modified time means something wrote to the file after the swap, so then its times are left as
+// they are. It is best effort: the swap has already happened.
+func keepTimes(f *os.File, orig Info) {
+	for range timeAttempts {
+		cur, err := statFile(f)
+		if err != nil || cur.Atime.Equal(orig.Atime) || !cur.Mtime.Equal(orig.Mtime) {
+			return
+		}
+		if SetTimes(f, orig.Atime, orig.Mtime) != nil {
+			return
+		}
+	}
 }
 
 // setACL makes f's macOS ACL exactly acl (nil for none). It does nothing on Linux, where ACLs are

@@ -5,9 +5,13 @@ package fileutil
 import (
 	"context"
 	"os"
+	"time"
 )
 
-const immutableHint = "read-only"
+const (
+	immutableHint   = "read-only"
+	undeletableHint = "undeletable"
+)
 
 // InfoOf is only implemented on Linux and macOS.
 func InfoOf(os.FileInfo) (Info, error) { return Info{}, ErrUnsupportedPlatform }
@@ -19,3 +23,6 @@ func ReplaceGroup(context.Context, *os.Root, []string, Options) (Result, error) 
 
 // RemoveStaleTemp is only implemented on Linux and macOS.
 func RemoveStaleTemp(*os.Root, string) (bool, error) { return false, ErrUnsupportedPlatform }
+
+// SetTimes is only implemented on Linux and macOS.
+func SetTimes(*os.File, time.Time, time.Time) error { return ErrUnsupportedPlatform }

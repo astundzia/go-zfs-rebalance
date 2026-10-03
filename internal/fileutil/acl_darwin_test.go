@@ -154,7 +154,7 @@ func TestReplaceInPlaceRefusesImmutable(t *testing.T) {
 }
 
 func TestMacACLRoundTrip(t *testing.T) {
-	dir := t.TempDir()
+	dir := testDir(t)
 	src := filepath.Join(dir, "src")
 	require.NoError(t, os.WriteFile(src, nil, 0o644))
 	addACL(t, src, "everyone deny delete")
@@ -173,4 +173,35 @@ func TestMacACLRoundTrip(t *testing.T) {
 	got, err = readACL(dst)
 	require.NoError(t, err)
 	require.Nil(t, got)
+}
+
+// Each kind of protection is reported as what it is, so the run's summary can count it correctly.
+// Only root can set the system flags, so they are checked here without a real file.
+func TestProtectedKinds(t *testing.T) {
+	tests := []struct {
+		name  string
+		flags uint32
+		want  error // nil: not protected
+	}{
+		{"plain", unix.UF_NODUMP | unix.UF_HIDDEN, nil},
+		{"user immutable", unix.UF_IMMUTABLE, ErrImmutable},
+		{"system immutable", unix.SF_IMMUTABLE, ErrImmutable},
+		{"user append-only", unix.UF_APPEND, ErrImmutable},
+		{"system append-only", unix.SF_APPEND, ErrImmutable},
+		{"undeletable", unix.SF_NOUNLINK, ErrUndeletable},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := fileAttrs{flags: tt.flags}.protected()
+			if tt.want == nil {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorIs(t, err, tt.want)
+			require.ErrorIs(t, err, ErrImmutable)
+			if tt.want == ErrImmutable {
+				require.NotErrorIs(t, err, ErrUndeletable)
+			}
+		})
+	}
 }

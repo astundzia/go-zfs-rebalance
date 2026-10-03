@@ -202,6 +202,103 @@ func TestReplaceGroupLocksLinkedTemps(t *testing.T) {
 	requireNoTemps(t, dir)
 }
 
+// lockFile takes a lock on name the way another program (or another run) would, and returns a
+// function that lets it go.
+func lockFile(t *testing.T, name string, how int) (unlock func()) {
+	t.Helper()
+	f, err := os.Open(name)
+	require.NoError(t, err)
+	require.NoError(t, unix.Flock(int(f.Fd()), how|unix.LOCK_NB))
+	return func() { require.NoError(t, f.Close()) }
+}
+
+// tryLock reports whether name can be locked right now, letting the lock go straight away.
+func tryLock(t *testing.T, name string) bool {
+	t.Helper()
+	f, err := os.Open(name)
+	require.NoError(t, err)
+	defer f.Close()
+	err = unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+	if errors.Is(err, unix.EWOULDBLOCK) {
+		return false
+	}
+	require.NoError(t, err)
+	return true
+}
+
+// A file that another program or run has locked is being worked on, so it is left alone before
+// anything is read or copied. Once the lock is gone it is rewritten as usual.
+func TestReplaceInPlaceLeavesLockedFileAlone(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		how   int
+		names []string
+	}{
+		{"exclusive lock", unix.LOCK_EX, []string{"f"}},
+		{"shared lock", unix.LOCK_SH, []string{"f"}},
+		{"lock through another hardlink", unix.LOCK_EX, []string{"f", "g"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir, root := newRoot(t)
+			name := filepath.Join(dir, "f")
+			require.NoError(t, os.WriteFile(name, randomBytes(t, 64<<10), 0o644))
+			for _, other := range tt.names[1:] {
+				require.NoError(t, os.Link(name, filepath.Join(dir, other)))
+			}
+			setOldAtime(t, name)
+			before := mustLstat(t, root, "f")
+			unlock := lockFile(t, filepath.Join(dir, tt.names[len(tt.names)-1]), tt.how)
+
+			_, err := ReplaceGroup(context.Background(), root, tt.names, Options{})
+			require.ErrorIs(t, err, ErrBusy)
+			require.Equal(t, "another program or another rebalance run is working on it, so it was left alone — nothing was changed", err.Error())
+			require.True(t, before.Atime.Equal(mustLstat(t, root, "f").Atime), "the file was read")
+			requireUntouched(t, root, "f", before)
+			requireNoTemps(t, dir)
+
+			unlock()
+			_, err = ReplaceGroup(context.Background(), root, tt.names, Options{})
+			require.NoError(t, err)
+			require.NotEqual(t, before.ID, mustLstat(t, root, "f").ID)
+		})
+	}
+}
+
+// The original stays locked while it is copied, so another run leaves it alone, and the lock goes
+// as soon as the rewrite ends, however it ends.
+func TestReplaceInPlaceLocksOriginalWhileCopying(t *testing.T) {
+	for _, fails := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fails %v", fails), func(t *testing.T) {
+			dir, root := newRoot(t)
+			name := filepath.Join(dir, "f")
+			require.NoError(t, os.WriteFile(name, randomBytes(t, 64<<10), 0o644))
+			before := mustLstat(t, root, "f")
+			checked := false
+			setSwapHook(t, func() {
+				checked = true
+				require.False(t, tryLock(t, name), "the original isn't locked while it is copied")
+				_, err := ReplaceInPlace(context.Background(), root, "f", Options{})
+				require.ErrorIs(t, err, ErrBusy, "a second rewrite of the same file must leave it alone")
+				if fails {
+					require.NoError(t, os.Chmod(name, 0o600))
+				}
+			})
+
+			_, err := ReplaceInPlace(context.Background(), root, "f", Options{})
+			require.True(t, checked)
+			if fails {
+				require.ErrorIs(t, err, ErrModified)
+				require.Equal(t, before.ID, mustLstat(t, root, "f").ID)
+			} else {
+				require.NoError(t, err)
+				require.NotEqual(t, before.ID, mustLstat(t, root, "f").ID)
+			}
+			require.True(t, tryLock(t, name), "the lock outlived the rewrite")
+			requireNoTemps(t, dir)
+		})
+	}
+}
+
 func TestRemoveStaleTemp(t *testing.T) {
 	const temp = ".zfs-rebalance.0123456789ab.tmp"
 	tests := []struct {

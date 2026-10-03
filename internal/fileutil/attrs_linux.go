@@ -15,7 +15,10 @@ import (
 // skipped or failed keeps its atime. Linux allows it for the file's owner and for root.
 const openNoATime = unix.O_NOATIME
 
-const immutableHint = "chattr +i / +a"
+const (
+	immutableHint   = "chattr +i / +a"
+	undeletableHint = "the ZFS nounlink attribute"
+)
 
 // Inode flags as FS_IOC_GETFLAGS reports them (lsattr, chattr).
 const (
@@ -143,16 +146,15 @@ func readFileAttrs(f *os.File) (fileAttrs, error) {
 }
 
 // protected returns an ErrImmutable error if the original can't be replaced because it is marked
-// immutable, append-only or (ZFS) undeletable. Renaming over such a file fails, so it is refused
-// before anything is copied.
+// immutable or append-only, or an ErrUndeletable one if ZFS protects it from being deleted.
+// Renaming over such a file fails, so it is refused before anything is copied.
 func (a fileAttrs) protected() error {
 	switch {
 	case a.hasFlags && a.flags&(fsImmutableFl|fsAppendFl) != 0,
 		a.hasDOS && a.dos&(zfsImmutable|zfsAppendonly) != 0:
 		return failKind(ErrImmutable, "", nil)
 	case a.hasDOS && a.dos&zfsNounlink != 0:
-		return &failure{kind: ErrImmutable.(*sentinel),
-			what: "it's protected from being deleted (the ZFS nounlink attribute), so it was left alone"}
+		return failKind(ErrUndeletable, "", nil)
 	}
 	return nil
 }
@@ -188,8 +190,8 @@ func prepareFileAttrs(root *os.Root, names []string, tmp *os.File, want fileAttr
 
 // checkProjectDirs refuses a file whose project ID differs from that of a folder holding one of its
 // names when that folder passes its project ID on to new files (chattr +P): Linux and ZFS won't
-// rename or link a file with another project ID into such a folder, so the copy could never take
-// the original's place.
+// rename or link a file with another project ID into such a folder (EXDEV), so the copy could never
+// take the original's place. See ErrProjectID.
 func checkProjectDirs(root *os.Root, names []string, projid uint32) error {
 	done := make(map[string]bool, 1)
 	for _, name := range names {
@@ -208,7 +210,7 @@ func checkProjectDirs(root *os.Root, names []string, projid uint32) error {
 		if ok, err := supported(err); err != nil {
 			return failKind(ErrMetadata, "project ID: "+reason(err), err)
 		} else if ok && fsx.xflags&projInheritX != 0 && fsx.projid != projid {
-			return failKind(ErrMetadata, "its project ID is different from its folder's, so a copy can't take its place", nil)
+			return failKind(ErrProjectID, "", nil)
 		}
 	}
 	return nil
@@ -245,20 +247,23 @@ func applyFileAttrs(tmp *os.File, want fileAttrs) error {
 	})
 }
 
-// afterSwap puts back the DOS attributes of the new file, open as fd, once it has taken the
-// original's place: ZFS turns the archive attribute on whenever a file is renamed or linked, so the
-// swap itself undoes a cleared one. It is best effort, as the swap has already happened.
-func afterSwap(fd int, want fileAttrs) {
+// afterSwap puts back the DOS attributes of the new file f once it has taken the original's place:
+// ZFS turns the archive attribute on whenever a file is renamed or linked, so the swap itself undoes
+// a cleared one. It is best effort, as the swap has already happened.
+func afterSwap(f *os.File, want fileAttrs) {
 	if !want.hasDOS {
 		return
 	}
-	var cur uint64
-	if ioctlPtr(fd, zfsIocGetDOSFlags, unsafe.Pointer(&cur)) != nil {
-		return
-	}
-	if next := want.dos & zfsDOSVisible; cur&zfsDOSVisible != next {
-		_ = ioctlPtr(fd, zfsIocSetDOSFlags, unsafe.Pointer(&next))
-	}
+	_ = withFd(f, func(fd int) error {
+		var cur uint64
+		if err := ioctlPtr(fd, zfsIocGetDOSFlags, unsafe.Pointer(&cur)); err != nil {
+			return err
+		}
+		if next := want.dos & zfsDOSVisible; cur&zfsDOSVisible != next {
+			return ioctlPtr(fd, zfsIocSetDOSFlags, unsafe.Pointer(&next))
+		}
+		return nil
+	})
 }
 
 // diffFileAttrs names the first of tmp's chattr flags, project ID and DOS attributes that differs
