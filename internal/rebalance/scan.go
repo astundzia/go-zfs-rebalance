@@ -19,10 +19,11 @@ const legacySuffix = ".balance"
 
 // Scan walks the folder once and works out what Execute should do. It leaves every file alone.
 //
-// It skips ".zfs" snapshot folders, the paths in Config.Exclude, symlinks and anything else that
-// isn't a regular file. Temporary files left by an earlier run go into Plan.StaleTemps. Files that
-// are already done (Config.Passes) and hardlinked files that can't be handled are counted in
-// Plan.Skipped. If ctx is cancelled the walk stops and ctx.Err() is returned.
+// It skips ".zfs" snapshot folders, the paths in Config.Exclude and Config.ExcludeIDs, symlinks and
+// anything else that isn't a regular file. Temporary files left by an earlier run go into
+// Plan.StaleTemps. Files that are already done (Config.Passes), hardlinked files that can't be
+// handled and, without root, files owned by someone else are counted in Plan.Skipped. If ctx is
+// cancelled the walk stops and ctx.Err() is returned.
 func (r *Rebalancer) Scan(ctx context.Context) (*Plan, error) {
 	counts, err := r.state.Counts()
 	if err != nil {
@@ -30,10 +31,11 @@ func (r *Rebalancer) Scan(ctx context.Context) (*Plan, error) {
 	}
 	r.excludes.refreshIDs()
 	s := &scanner{
-		r:      r,
-		ctx:    ctx,
-		plan:   &Plan{Skipped: make(map[SkipReason]int), dirs: make(map[string]dirTimes)},
-		groups: make(map[fileutil.FileID]linkGroup),
+		r:       r,
+		ctx:     ctx,
+		plan:    &Plan{Skipped: make(map[SkipReason]int), dirs: make(map[string]dirTimes)},
+		groups:  make(map[fileutil.FileID]linkGroup),
+		folders: make(map[string]fileutil.Info),
 	}
 	err = fs.WalkDir(r.root.FS(), ".", s.visit)
 	if ctxErr := ctx.Err(); ctxErr != nil {
@@ -47,11 +49,12 @@ func (r *Rebalancer) Scan(ctx context.Context) (*Plan, error) {
 }
 
 type scanner struct {
-	r      *Rebalancer
-	ctx    context.Context
-	plan   *Plan
-	items  []Item // in walk order; a hardlinked file sits where its first name was found
-	groups map[fileutil.FileID]linkGroup
+	r       *Rebalancer
+	ctx     context.Context
+	plan    *Plan
+	items   []Item // in walk order; a hardlinked file sits where its first name was found
+	groups  map[fileutil.FileID]linkGroup
+	folders map[string]fileutil.Info // every folder walked so far
 }
 
 // linkGroup is a hardlinked file being collected: where it is in scanner.items, and how many
@@ -87,7 +90,8 @@ func (s *scanner) visit(rel string, d fs.DirEntry, err error) error {
 		if s.r.excludes.match(rel, info.ID) {
 			return fs.SkipDir
 		}
-		s.plan.dirs[rel] = dirTimes{id: info.ID, atime: info.Atime, mtime: info.Mtime}
+		s.folders[rel] = info
+		s.plan.dirs[rel] = dirTimes{id: info.ID, atime: info.Atime, mtime: info.Mtime, ctime: info.Ctime}
 		return nil
 	}
 	if !d.Type().IsRegular() {
@@ -120,6 +124,14 @@ func (s *scanner) visit(rel string, d fs.DirEntry, err error) error {
 		}
 	}
 
+	// Checked here, before anything is read, so a run without root never copies a file it
+	// can't give back to its owner.
+	if why := s.r.as.cantRewrite(info, s.folders[path.Dir(rel)]); why != "" {
+		s.plan.Skipped[SkipOwner]++
+		s.r.log.WithFields(logrus.Fields{"op": "skipped", "path": rel, "reason": why}).Debug("Skipped")
+		return nil
+	}
+
 	if info.Nlink > 1 {
 		if !s.r.cfg.ProcessHardlinks {
 			s.plan.Skipped[SkipHardlinked]++
@@ -129,12 +141,12 @@ func (s *scanner) visit(rel string, d fs.DirEntry, err error) error {
 		if !ok {
 			g = linkGroup{index: len(s.items), nlink: info.Nlink}
 			s.groups[info.ID] = g
-			s.items = append(s.items, Item{Size: info.Size})
+			s.items = append(s.items, Item{Size: info.Size, Allocated: info.Blocks})
 		}
 		s.items[g.index].Names = append(s.items[g.index].Names, rel)
 		return nil
 	}
-	s.items = append(s.items, Item{Names: []string{rel}, Size: info.Size})
+	s.items = append(s.items, Item{Names: []string{rel}, Size: info.Size, Allocated: info.Blocks})
 	return nil
 }
 
@@ -142,16 +154,21 @@ func (s *scanner) visit(rel string, d fs.DirEntry, err error) error {
 func (s *scanner) finish(counts map[string]int) {
 	p := s.plan
 	// A hardlinked file with names outside the folder (or being changed right now) is left alone:
-	// rewriting only some of its names would split it into two separate copies.
-	incomplete := make(map[int]bool)
+	// rewriting only some of its names would split it into two separate copies. Each name found
+	// is logged, so the user can find the file and point the run at a folder holding all of them.
+	incomplete := make(map[int]uint64)
 	for _, g := range s.groups {
 		if uint64(len(s.items[g.index].Names)) != g.nlink {
-			incomplete[g.index] = true
+			incomplete[g.index] = g.nlink
 		}
 	}
 	for i, it := range s.items {
-		if incomplete[i] {
+		if nlink, ok := incomplete[i]; ok {
 			p.Skipped[SkipHardlinksOutside] += len(it.Names)
+			why := outsideReason(len(it.Names), nlink)
+			for _, name := range it.Names {
+				s.r.log.WithFields(logrus.Fields{"op": "skipped", "path": name, "reason": why}).Info("Skipped")
+			}
 			continue
 		}
 		done := 0
@@ -166,6 +183,7 @@ func (s *scanner) finish(counts map[string]int) {
 		p.TotalFiles += len(it.Names)
 		p.TotalBytes += it.Size
 		p.LargestFile = max(p.LargestFile, it.Size)
+		p.LargestAllocated = max(p.LargestAllocated, it.Allocated)
 	}
 	if s.r.cfg.RandomOrder {
 		rand.Shuffle(len(p.Items), func(i, j int) { p.Items[i], p.Items[j] = p.Items[j], p.Items[i] })
@@ -188,6 +206,19 @@ func (s *scanner) finish(counts map[string]int) {
 			delete(p.dirs, dir)
 		}
 	}
+}
+
+// outsideReason explains why a hardlinked file found under found of its nlink names is left alone.
+func outsideReason(found int, nlink uint64) string {
+	if uint64(found) > nlink {
+		return "its hardlinks changed while the folder was being looked through, so it was left alone"
+	}
+	outside := nlink - uint64(found)
+	verb := "are"
+	if outside == 1 {
+		verb = "is"
+	}
+	return fmt.Sprintf("%d of its %d hardlinked names %s outside this folder, so it was left alone", outside, nlink, verb)
 }
 
 func (s *scanner) warn(rel, msg string, err error) {

@@ -115,6 +115,64 @@ func TestStopReasonStrings(t *testing.T) {
 	}
 }
 
+func TestSkipReasonPhrase(t *testing.T) {
+	tests := []struct {
+		why  SkipReason
+		n    int
+		want string
+	}{
+		{SkipOrphanBalance, 1, "1 leftover .balance file"},
+		{SkipOrphanBalance, 2, "2 leftover .balance files"},
+		{SkipOwner, 1, "1 file owned by someone else"},
+		{SkipOwner, 3, "3 files owned by someone else"},
+		{SkipHardlinksOutside, 1, "1 file with hardlinks outside the folder"},
+		{SkipAlreadyDone, 1234, "1,234 already done"},
+		{SkipHardlinked, 1, "1 hardlinked"},
+		{SkipNotRegular, 2, "2 not regular files"},
+		{SkipMetadata, 2, "2 files whose permissions can't be kept exactly"},
+		{SkipNoPermission, 1, "1 file you aren't allowed to replace"},
+		{SkipImmutable, 5, "5 files marked immutable or append-only"},
+		{SkipQuota, 1, "1 file whose owner or group is over quota"},
+		{SkipReason("something new"), 1000000, "1,000,000 something new"},
+	}
+	for _, tt := range tests {
+		if got := tt.why.Phrase(tt.n); got != tt.want {
+			t.Errorf("%q.Phrase(%d) = %q, want %q", tt.why, tt.n, got, tt.want)
+		}
+	}
+	every := []SkipReason{SkipAlreadyDone, SkipHardlinked, SkipHardlinksOutside, SkipOrphanBalance, SkipUnreadable,
+		SkipMissing, SkipOwner, SkipChanged, SkipLinksChanged, SkipNotRegular, SkipMetadata, SkipNoPermission,
+		SkipImmutable, SkipQuota}
+	for _, why := range every {
+		if _, ok := skipPhrases[why]; !ok {
+			t.Errorf("%q has no phrases", why)
+		}
+		if one, two := why.Phrase(1), why.Phrase(2); !strings.HasPrefix(one, "1 ") || !strings.HasPrefix(two, "2 ") {
+			t.Errorf("%q: %q, %q", why, one, two)
+		}
+	}
+	if len(skipPhrases) != len(every) {
+		t.Errorf("%d phrases for %d reasons", len(skipPhrases), len(every))
+	}
+}
+
+func TestOutsideReason(t *testing.T) {
+	tests := []struct {
+		found int
+		nlink uint64
+		want  string
+	}{
+		{1, 2, "1 of its 2 hardlinked names is outside this folder, so it was left alone"},
+		{1, 3, "2 of its 3 hardlinked names are outside this folder, so it was left alone"},
+		{3, 2, "its hardlinks changed while the folder was being looked through, so it was left alone"},
+	}
+	for _, tt := range tests {
+		if got := outsideReason(tt.found, tt.nlink); got != tt.want {
+			t.Errorf("outsideReason(%d, %d) = %q, want %q", tt.found, tt.nlink, got, tt.want)
+		}
+	}
+}
+
 func TestExecuteNeedsAPlan(t *testing.T) {
 	r, _ := newRebalancer(t, Config{Root: tempRoot(t)})
 	if _, err := r.Execute(context.Background(), nil); err == nil {

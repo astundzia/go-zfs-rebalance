@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -41,12 +42,13 @@ type Config struct {
 	HaltOnMissing    bool                  // stop the run when a file disappears before it is rewritten
 	SizeThresholdMB  int                   // successes for files smaller than this are logged at Debug level
 	Exclude          []string              // absolute paths to leave alone, such as the state database files
+	ExcludeIDs       []fileutil.FileID     // files (or folders) to leave alone, such as the run's own log file
 	Logger           *logrus.Logger        // nil discards all log output
 	State            StateStore            // nil keeps progress in memory for the life of the Rebalancer
 }
 
-// SkipReason says why a file was left as it was. The values are short phrases meant for a summary
-// line, such as "12 already done".
+// SkipReason says why a file was left as it was. Use Phrase to describe a number of files skipped
+// for a reason, such as "12 already done".
 type SkipReason string
 
 // Reasons a file can be skipped.
@@ -57,12 +59,47 @@ const (
 	SkipOrphanBalance    SkipReason = "leftover .balance file"
 	SkipUnreadable       SkipReason = "couldn't be read"
 	SkipMissing          SkipReason = "missing"
-	SkipOwner            SkipReason = "owner can't be kept"
+	SkipOwner            SkipReason = "owner can't be kept" // owned by someone else, or its owner can't be kept
 	SkipChanged          SkipReason = "changed while copying"
 	SkipLinksChanged     SkipReason = "hardlinks changed"
 	SkipNotRegular       SkipReason = "not a regular file"
 	SkipMetadata         SkipReason = "permissions can't be kept exactly"
+	SkipNoPermission     SkipReason = "no permission"    // without root: the file or its folder can't be changed
+	SkipImmutable        SkipReason = "immutable"        // marked immutable, append-only or undeletable
+	SkipQuota            SkipReason = "owner over quota" // its owner or group is over their quota
 )
+
+// skipPhrases are the singular and plural forms Phrase uses.
+var skipPhrases = map[SkipReason][2]string{
+	SkipAlreadyDone:      {"already done", "already done"},
+	SkipHardlinked:       {"hardlinked", "hardlinked"},
+	SkipHardlinksOutside: {"file with hardlinks outside the folder", "files with hardlinks outside the folder"},
+	SkipOrphanBalance:    {"leftover .balance file", "leftover .balance files"},
+	SkipUnreadable:       {"couldn't be read", "couldn't be read"},
+	SkipMissing:          {"missing", "missing"},
+	SkipOwner:            {"file owned by someone else", "files owned by someone else"},
+	SkipChanged:          {"changed while copying", "changed while copying"},
+	SkipLinksChanged:     {"file whose hardlinks changed", "files whose hardlinks changed"},
+	SkipNotRegular:       {"not a regular file", "not regular files"},
+	SkipMetadata:         {"file whose permissions can't be kept exactly", "files whose permissions can't be kept exactly"},
+	SkipNoPermission:     {"file you aren't allowed to replace", "files you aren't allowed to replace"},
+	SkipImmutable:        {"file marked immutable or append-only", "files marked immutable or append-only"},
+	SkipQuota:            {"file whose owner or group is over quota", "files whose owners or groups are over quota"},
+}
+
+// Phrase describes n files skipped for this reason, for a summary line: "1 leftover .balance file",
+// "2 leftover .balance files", "1,234 already done". The number has commas between groups of three
+// digits.
+func (s SkipReason) Phrase(n int) string {
+	forms, ok := skipPhrases[s]
+	if !ok {
+		return thousands(n) + " " + string(s)
+	}
+	if n == 1 {
+		return "1 " + forms[0]
+	}
+	return thousands(n) + " " + forms[1]
+}
 
 // StopReason says why a run ended before every file was handled.
 type StopReason int
@@ -92,29 +129,33 @@ func (s StopReason) String() string {
 
 // Item is one piece of work: a file, or every name of a hardlinked file.
 type Item struct {
-	Names []string // slash-separated paths relative to the root; Names[0] is the primary name
-	Size  int64
+	Names     []string // slash-separated paths relative to the root; Names[0] is the primary name
+	Size      int64
+	Allocated int64 // bytes it takes up on disk when Scan saw it; less than Size if sparse or compressed
 }
 
 // Plan is the work found by Scan. Pass it to Execute.
 type Plan struct {
-	Items         []Item             // files to rewrite, in the order they will be handed out
-	TotalFiles    int                // names in Items (a hardlinked file counts once per name)
-	TotalBytes    int64              // bytes to rewrite (a hardlinked file counts once)
-	LargestFile   int64              // size of the largest item
-	Skipped       map[SkipReason]int // files left alone, by reason (one per name)
-	StaleTemps    []string           // temporary files left behind by an earlier run
-	LegacyBalance []string           // files ending in ".balance", possibly left behind by version 1
-	OrphanBalance []string           // the LegacyBalance files with no matching original; never rewritten
+	Items            []Item             // files to rewrite, in the order they will be handed out
+	TotalFiles       int                // names in Items (a hardlinked file counts once per name)
+	TotalBytes       int64              // bytes to rewrite (a hardlinked file counts once)
+	LargestFile      int64              // size of the largest item
+	LargestAllocated int64              // disk space the largest item takes up: about what one copy needs free
+	Skipped          map[SkipReason]int // files left alone, by reason (one per name)
+	StaleTemps       []string           // temporary files left behind by an earlier run
+	LegacyBalance    []string           // files ending in ".balance", possibly left behind by version 1
+	OrphanBalance    []string           // the LegacyBalance files with no matching original; never rewritten
 
 	dirs map[string]dirTimes // times of the folders the run will touch, to put back afterwards
 }
 
 // dirTimes is a folder's identity and timestamps as seen by Scan.
 type dirTimes struct {
-	id           fileutil.FileID
-	atime, mtime time.Time
+	id                  fileutil.FileID
+	atime, mtime, ctime time.Time
 }
+
+func (d dirTimes) stamp() stamp { return stamp{id: d.id, mtime: d.mtime, ctime: d.ctime} }
 
 // Summary is the outcome of Execute.
 type Summary struct {
@@ -126,6 +167,10 @@ type Summary struct {
 	Bytes      int64              // bytes rewritten
 	Duration   time.Duration
 	Stopped    StopReason
+	// FolderTimesNotRestored counts folders whose modified time the run changed and couldn't put
+	// back (each is also logged as a warning). Folders another program changed during the run are
+	// left with their new time on purpose and aren't counted.
+	FolderTimesNotRestored int
 }
 
 // Progress is a snapshot of a running Execute. Counts are per file name, like Summary.
@@ -150,6 +195,7 @@ type Rebalancer struct {
 	root     *os.Root
 	opts     fileutil.Options
 	excludes exclusions
+	as       account // who the run works as
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
@@ -195,7 +241,7 @@ func New(cfg Config) (*Rebalancer, error) {
 	case !fi.IsDir():
 		return nil, fmt.Errorf("%q isn't a folder", cfg.Root)
 	}
-	excludes, err := newExclusions(cfg.Root, cfg.Exclude)
+	excludes, err := newExclusions(cfg.Root, cfg.Exclude, cfg.ExcludeIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -211,6 +257,7 @@ func New(cfg Config) (*Rebalancer, error) {
 		root:     root,
 		opts:     fileutil.Options{Checksum: cfg.Checksum},
 		excludes: excludes,
+		as:       currentAccount(),
 		stopCh:   make(chan struct{}),
 	}
 	if r.log == nil {
@@ -287,13 +334,14 @@ func (m *memoryState) Increment(rel string) (int, error) {
 // files are also matched by identity, so a spelling difference can never get a database rewritten.
 type exclusions struct {
 	given    []string                 // as passed in Config.Exclude
+	fixedIDs []fileutil.FileID        // as passed in Config.ExcludeIDs
 	paths    map[string]bool          // cleaned absolute paths, in every spelling known
 	rootDirs []string                 // the root, as given and resolved
 	ids      map[fileutil.FileID]bool // filled in by Scan, since files may appear after New
 }
 
-func newExclusions(root string, given []string) (exclusions, error) {
-	e := exclusions{given: given, paths: make(map[string]bool), rootDirs: []string{root}}
+func newExclusions(root string, given []string, ids []fileutil.FileID) (exclusions, error) {
+	e := exclusions{given: given, fixedIDs: ids, paths: make(map[string]bool), rootDirs: []string{root}}
 	if resolved, err := filepath.EvalSymlinks(root); err == nil && resolved != root {
 		e.rootDirs = append(e.rootDirs, resolved)
 	}
@@ -312,7 +360,10 @@ func newExclusions(root string, given []string) (exclusions, error) {
 
 // refreshIDs records the identity of every excluded path that exists right now.
 func (e *exclusions) refreshIDs() {
-	e.ids = make(map[fileutil.FileID]bool, len(e.given))
+	e.ids = make(map[fileutil.FileID]bool, len(e.given)+len(e.fixedIDs))
+	for _, id := range e.fixedIDs {
+		e.ids[id] = true
+	}
 	for _, p := range e.given {
 		if fi, err := os.Stat(p); err == nil {
 			if info, err := fileutil.InfoOf(fi); err == nil {
@@ -325,7 +376,7 @@ func (e *exclusions) refreshIDs() {
 // match reports whether rel (relative to the root, slash-separated), whose identity is id, must be
 // left alone.
 func (e *exclusions) match(rel string, id fileutil.FileID) bool {
-	if len(e.given) == 0 {
+	if len(e.given) == 0 && len(e.fixedIDs) == 0 {
 		return false
 	}
 	if e.ids[id] {
@@ -350,4 +401,17 @@ func reasonOf(err error) string {
 		return le.Err.Error()
 	}
 	return err.Error()
+}
+
+// thousands writes n with commas between groups of three digits, such as "1,234,567".
+func thousands(n int) string {
+	s := strconv.Itoa(n)
+	sign := ""
+	if n < 0 {
+		sign, s = "-", s[1:]
+	}
+	for i := len(s) - 3; i > 0; i -= 3 {
+		s = s[:i] + "," + s[i:]
+	}
+	return sign + s
 }

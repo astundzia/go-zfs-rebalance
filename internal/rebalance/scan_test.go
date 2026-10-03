@@ -9,10 +9,13 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"syscall"
 	"testing"
 
+	"github.com/astundzia/go-zfs-rebalance/v2/internal/fileutil"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 )
 
 const staleTemp = "dir/sub/.zfs-rebalance.0123456789ab.tmp"
@@ -191,7 +194,7 @@ func TestHardlinkGroupInsideRoot(t *testing.T) {
 	}
 	before := snapshot(t, root)
 	state := newHookState()
-	r, _ := newRebalancer(t, Config{Root: root, ProcessHardlinks: true, State: state})
+	r, logs := newRebalancer(t, Config{Root: root, ProcessHardlinks: true, State: state})
 
 	p, s := scanAndExecute(t, r)
 	if len(p.Items) != 2 || p.TotalFiles != 4 || p.TotalBytes != 70<<10+5 {
@@ -199,6 +202,23 @@ func TestHardlinkGroupInsideRoot(t *testing.T) {
 	}
 	if s.Rebalanced != 4 || s.Failed != 0 || len(s.Skipped) != 0 {
 		t.Errorf("summary = %+v", s)
+	}
+	// The group's line names all of it, so the user can see that every name was switched.
+	wantNames := []string{"d1/two", "d2/three", "one"}
+	for _, e := range logs.op("rebalanced") {
+		names, isGroup := e.data["names"].([]string)
+		switch e.data["path"] {
+		case "solo":
+			if isGroup {
+				t.Errorf("a single file's line lists names: %+v", e)
+			}
+		case wantNames[0]:
+			if !slices.Equal(names, wantNames) || !strings.Contains(e.msg, "3 hardlinked names") {
+				t.Errorf("the group's line = %+v, want names %q", e, wantNames)
+			}
+		default:
+			t.Errorf("unexpected rebalanced line %+v", e)
+		}
 	}
 	after := snapshot(t, root)
 	checkRewritten(t, before, after, "one", "d1/two", "d2/three", "solo")
@@ -223,16 +243,38 @@ func TestHardlinkGroupOutsideRootLeftAlone(t *testing.T) {
 	base := tempRoot(t)
 	root := filepath.Join(base, "root")
 	writeFile(t, root, "inside", []byte("shared"))
+	writeFile(t, root, "pair/one", []byte("three names"))
+	for _, link := range []string{"root/pair/two", "elsewhere"} {
+		if err := os.Link(filepath.Join(root, "pair/one"), filepath.Join(base, link)); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := os.Link(filepath.Join(root, "inside"), filepath.Join(base, "outside")); err != nil {
 		t.Fatal(err)
 	}
 	before := snapshot(t, base)
-	r, _ := newRebalancer(t, Config{Root: root, ProcessHardlinks: true})
+	r, logs := newRebalancer(t, Config{Root: root, ProcessHardlinks: true})
 
 	p, s := scanAndExecute(t, r)
-	if len(p.Items) != 0 || s.Skipped[SkipHardlinksOutside] != 1 || s.Rebalanced != 0 {
+	if len(p.Items) != 0 || s.Skipped[SkipHardlinksOutside] != 3 || s.Rebalanced != 0 {
 		t.Errorf("plan %+v, summary %+v", p, s)
 	}
+	// Every name found is logged, so the user can tell which files were left alone.
+	want := map[string]string{
+		"inside":   "1 of its 2 hardlinked names is outside this folder, so it was left alone",
+		"pair/one": "1 of its 3 hardlinked names is outside this folder, so it was left alone",
+		"pair/two": "1 of its 3 hardlinked names is outside this folder, so it was left alone",
+	}
+	skipped := logs.op("skipped")
+	if len(skipped) != len(want) {
+		t.Errorf("skipped log lines = %+v", skipped)
+	}
+	for _, e := range skipped {
+		if rel, _ := e.data["path"].(string); e.level != logrus.InfoLevel || e.data["reason"] != want[rel] {
+			t.Errorf("skipped log line = %+v", e)
+		}
+	}
+	checkUntouched(t, before, snapshot(t, base), "root/pair/one", "root/pair/two", "elsewhere")
 	checkUntouched(t, before, snapshot(t, base), "root/inside", "outside")
 	if n := lstatInfo(t, filepath.Join(root, "inside")).Nlink; n != 2 {
 		t.Errorf("link count = %d, want 2", n)
@@ -267,6 +309,117 @@ func TestExcludedPathsLeftAlone(t *testing.T) {
 		t.Errorf("planned %q, summary %+v", itemNames(p), s)
 	}
 	checkUntouched(t, before, snapshot(t, root), "keep/state.db", "keep/state.db-wal", "skipdir/inner")
+}
+
+// A temporary file whose lock is held belongs to a run that is still going, so the cleanup leaves
+// it alone; once the lock is gone it is a leftover like any other.
+func TestStaleTempInUseLeftAlone(t *testing.T) {
+	root := tempRoot(t)
+	const inUse = "dir/.zfs-rebalance.ba9876543210.tmp"
+	writeFile(t, root, "f", []byte("data"))
+	writeFile(t, root, staleTemp, []byte("half a copy"))
+	writeFile(t, root, inUse, []byte("another run's copy"))
+	held, err := os.Open(filepath.Join(root, inUse))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	if err := unix.Flock(int(held.Fd()), unix.LOCK_EX); err != nil { // as the other run would
+		t.Fatal(err)
+	}
+	r, logs := newRebalancer(t, Config{Root: root, Cleanup: true})
+
+	p, s := scanAndExecute(t, r)
+	if want := []string{inUse, staleTemp}; !slices.Equal(p.StaleTemps, want) || s.Rebalanced != 1 {
+		t.Errorf("stale temps %q, summary %+v", p.StaleTemps, s)
+	}
+	after := snapshot(t, root)
+	if _, ok := after[staleTemp]; ok {
+		t.Error("the leftover temporary file wasn't removed")
+	}
+	if _, ok := after[inUse]; !ok {
+		t.Fatal("the temporary file another run is using was removed")
+	}
+	if removed := logs.op("removed-temp"); len(removed) != 1 || removed[0].data["path"] != staleTemp {
+		t.Errorf("removed-temp log lines = %+v", removed)
+	}
+	if l := logs.about(inUse); len(l) != 1 || l[0].level != logrus.InfoLevel || !strings.Contains(l[0].msg, "being used by another run") {
+		t.Errorf("log lines about the temporary file in use = %+v", l)
+	}
+	if w := logs.op("warning"); len(w) != 0 {
+		t.Errorf("warnings = %+v", w)
+	}
+	logs.checkNoPathsInMessages(t)
+
+	if err := held.Close(); err != nil { // the other run has ended
+		t.Fatal(err)
+	}
+	r2, logs2 := newRebalancer(t, Config{Root: root, Cleanup: true})
+	scanAndExecute(t, r2)
+	if removed := logs2.op("removed-temp"); len(removed) != 1 || removed[0].data["path"] != inUse {
+		t.Errorf("second run's removed-temp log lines = %+v", removed)
+	}
+	checkNoTemps(t, root)
+}
+
+// ExcludeIDs leaves files alone by identity, whatever they are called, such as the file the
+// command's own output is going to.
+func TestExcludeIDsLeftAlone(t *testing.T) {
+	root := tempRoot(t)
+	for _, rel := range []string{"run.log", "keep/inner", "other"} {
+		writeFile(t, root, rel, []byte(rel))
+	}
+	if err := os.Link(filepath.Join(root, "run.log"), filepath.Join(root, "run.log.link")); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshot(t, root)
+	ids := []fileutil.FileID{lstatInfo(t, filepath.Join(root, "run.log")).ID, lstatInfo(t, filepath.Join(root, "keep")).ID}
+	r, _ := newRebalancer(t, Config{Root: root, ExcludeIDs: ids, ProcessHardlinks: true})
+
+	p, s := scanAndExecute(t, r)
+	if !slices.Equal(itemNames(p), []string{"other"}) || s.Rebalanced != 1 || len(s.Skipped) != 0 {
+		t.Errorf("planned %q, summary %+v", itemNames(p), s)
+	}
+	checkUntouched(t, before, snapshot(t, root), "run.log", "run.log.link", "keep/inner")
+}
+
+// The plan says how much disk space its largest item takes up, which for a sparse or compressed
+// file is less than its size.
+func TestLargestAllocated(t *testing.T) {
+	root := tempRoot(t)
+	writeFile(t, root, "small", randomBytes(10<<10))
+	writeFile(t, root, "medium", randomBytes(300<<10))
+	sparse := filepath.Join(root, "sparse")
+	f, err := os.Create(sparse)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(randomBytes(4 << 10)); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(64 << 20); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	r, _ := newRebalancer(t, Config{Root: root})
+
+	p := scan(t, r)
+	var want int64
+	for _, it := range p.Items {
+		info := lstatInfo(t, filepath.Join(root, it.Names[0]))
+		if it.Allocated != info.Blocks {
+			t.Errorf("%s: allocated %d, want %d", it.Names[0], it.Allocated, info.Blocks)
+		}
+		want = max(want, info.Blocks)
+	}
+	if p.LargestAllocated != want || p.LargestFile != 64<<20 {
+		t.Errorf("largest allocated %d (want %d), largest file %d", p.LargestAllocated, want, p.LargestFile)
+	}
+	if lstatInfo(t, sparse).Blocks < 64<<20 && p.LargestAllocated >= p.LargestFile {
+		t.Errorf("largest allocated %d isn't below the sparse file's size", p.LargestAllocated)
+	}
 }
 
 func TestScanStopsWhenCancelled(t *testing.T) {

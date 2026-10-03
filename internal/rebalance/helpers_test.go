@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"errors"
 	"io"
 	"io/fs"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/astundzia/go-zfs-rebalance/v2/internal/fileutil"
 	"github.com/sirupsen/logrus"
@@ -58,6 +60,19 @@ func (c *logCapture) op(op string) []logEntry {
 	return out
 }
 
+// about returns the entries whose "path" field is rel.
+func (c *logCapture) about(rel string) []logEntry {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []logEntry
+	for _, e := range c.entries {
+		if e.data["path"] == rel {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 // checkNoPathsInMessages fails if any message repeats the path it is about.
 func (c *logCapture) checkNoPathsInMessages(t *testing.T) {
 	t.Helper()
@@ -79,10 +94,24 @@ func newTestLogger() (*logrus.Logger, *logCapture) {
 	return l, c
 }
 
+// testDirEnv names a folder to run the tests in instead of the system's temporary folder, for
+// example one on a ZFS dataset, as fileutil's tests do.
+const testDirEnv = "REBALANCE_TEST_DIR"
+
 // tempRoot returns a new empty folder with symlinks resolved, as the command passes it.
 func tempRoot(t *testing.T) string {
 	t.Helper()
-	dir, err := filepath.EvalSymlinks(t.TempDir())
+	var dir string
+	if base := os.Getenv(testDirEnv); base != "" {
+		var err error
+		if dir, err = os.MkdirTemp(base, "rebalance-test-"); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	} else {
+		dir = t.TempDir()
+	}
+	dir, err := filepath.EvalSymlinks(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,6 +146,26 @@ func lstatInfo(t *testing.T, p string) fileutil.Info {
 		t.Fatal(err)
 	}
 	return info
+}
+
+// oldAtime is an access time well before any file's modified time, so that reading a file moves
+// it forward even with Linux's relatime.
+var oldAtime = time.Date(2001, 2, 3, 4, 5, 6, 0, time.UTC)
+
+// setOldAtime gives p an access time of oldAtime, keeping its modified time.
+func setOldAtime(t *testing.T, p string) {
+	t.Helper()
+	if err := os.Chtimes(p, oldAtime, lstatInfo(t, p).Mtime); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ownerOf returns an account without root that owns the file p and is in its group, as the user
+// running the tests is for the files they create.
+func ownerOf(t *testing.T, p string) account {
+	t.Helper()
+	info := lstatInfo(t, p)
+	return account{uid: info.UID, groups: map[uint32]bool{info.GID: true}}
 }
 
 // fileState is what a test remembers about a file to compare after a run.
@@ -284,5 +333,15 @@ func stubReplace(t *testing.T, rel string, err error) {
 			return fileutil.Result{}, err
 		}
 		return fileutil.ReplaceGroup(ctx, root, rels, opts)
+	}
+}
+
+// forbidReplace fails the test if any file is rewritten (or even opened to be rewritten).
+func forbidReplace(t *testing.T) {
+	t.Helper()
+	t.Cleanup(func() { replace = fileutil.ReplaceGroup })
+	replace = func(context.Context, *os.Root, []string, fileutil.Options) (fileutil.Result, error) {
+		t.Error("a file was handed to fileutil to be rewritten")
+		return fileutil.Result{}, errors.New("not allowed in this test")
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -193,7 +194,9 @@ func TestFilesChangedAfterScanAreSkipped(t *testing.T) {
 	checkUntouched(t, before, snapshot(t, root), "gets-a-link", "new-link")
 }
 
-func TestUnwritableFolderCountsAsFailed(t *testing.T) {
+// Without root, a file of the user's own in a folder they can't write to is skipped, with a hint
+// to use sudo, rather than reported as a failure.
+func TestUnwritableFolderIsSkippedWithoutRoot(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root can write to any folder")
 	}
@@ -208,15 +211,75 @@ func TestUnwritableFolderCountsAsFailed(t *testing.T) {
 	r, logs := newRebalancer(t, Config{Root: root})
 
 	_, s := scanAndExecute(t, r)
-	if s.Failed != 1 || s.Rebalanced != 0 || s.Stopped != None {
+	if s.Skipped[SkipNoPermission] != 1 || s.Failed != 0 || s.Rebalanced != 0 || s.Stopped != None {
 		t.Errorf("summary = %+v", s)
 	}
-	f := logs.op("failed")
-	if len(f) != 1 || f[0].level != logrus.ErrorLevel || f[0].data["path"] != "locked/f" ||
-		!strings.Contains(fmt.Sprint(f[0].data["reason"]), "permission denied") {
+	sk := logs.op("skipped")
+	if len(sk) != 1 || sk[0].level != logrus.InfoLevel || sk[0].data["path"] != "locked/f" || sk[0].data["reason"] != reasonNoPermission {
+		t.Errorf("skipped log lines = %+v", sk)
+	}
+	if f := logs.op("failed"); len(f) != 0 {
 		t.Errorf("failed log lines = %+v", f)
 	}
 	checkUntouched(t, before, snapshot(t, root), "locked/f")
+}
+
+// Being refused permission to open a file, or to add or swap a copy in its folder, is something
+// only root can get past: without root the file is skipped, with root it is a failure. Errors of
+// fileutil's own kinds keep their meaning even when a permission error caused them.
+func TestPermissionErrorsDependOnRoot(t *testing.T) {
+	denied := fmt.Errorf("couldn't open the file (permission denied): %w",
+		&os.PathError{Op: "open", Path: "a", Err: syscall.EACCES})
+	notPermitted := fmt.Errorf("couldn't swap in the new copy (operation not permitted): %w",
+		&os.LinkError{Op: "rename", Old: ".zfs-rebalance.0123456789ab.tmp", New: "a", Err: syscall.EPERM})
+	metadata := fmt.Errorf("%w (timestamps: operation not permitted): %w", fileutil.ErrMetadata, syscall.EPERM)
+	ownership := fmt.Errorf("%w: %w", fileutil.ErrOwnership, syscall.EPERM)
+
+	tests := []struct {
+		name   string
+		err    error
+		asRoot bool
+		skip   SkipReason // "" means it fails
+		reason string
+	}{
+		{"open refused", denied, false, SkipNoPermission, reasonNoPermission},
+		{"rename refused", notPermitted, false, SkipNoPermission, reasonNoPermission},
+		{"open refused to root", denied, true, "", denied.Error()},
+		{"rename refused to root", notPermitted, true, "", notPermitted.Error()},
+		{"metadata", metadata, false, SkipMetadata, metadata.Error()},
+		{"ownership", ownership, false, SkipOwner, ownership.Error()},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := tempRoot(t)
+			for _, n := range []string{"a", "b"} {
+				writeFile(t, root, n, []byte(n))
+			}
+			stubReplace(t, "a", tt.err)
+			r, logs := newRebalancer(t, Config{Root: root, Concurrency: 1})
+			r.as = ownerOf(t, filepath.Join(root, "a"))
+			if tt.asRoot {
+				r.as = account{root: true}
+			}
+
+			_, s := scanAndExecute(t, r)
+			if s.Rebalanced != 1 || s.Stopped != None {
+				t.Errorf("summary = %+v", s)
+			}
+			op := "skipped"
+			if tt.skip == "" {
+				op = "failed"
+				if s.Failed != 1 {
+					t.Errorf("failed = %d, want 1", s.Failed)
+				}
+			} else if s.Skipped[tt.skip] != 1 || s.Failed != 0 {
+				t.Errorf("skipped %v, failed %d; want 1 %q", s.Skipped, s.Failed, tt.skip)
+			}
+			if l := logs.op(op); len(l) != 1 || l[0].data["path"] != "a" || l[0].data["reason"] != tt.reason {
+				t.Errorf("%s log lines = %+v", op, l)
+			}
+		})
+	}
 }
 
 func TestOutcomeOfEachError(t *testing.T) {
@@ -234,6 +297,7 @@ func TestOutcomeOfEachError(t *testing.T) {
 		{err: fileutil.ErrNotRegular, skip: SkipNotRegular, level: logrus.InfoLevel},
 		{err: fileutil.ErrChecksum, failed: 1, level: logrus.ErrorLevel},
 		{err: fileutil.ErrMetadata, skip: SkipMetadata, level: logrus.WarnLevel},
+		{err: fileutil.ErrImmutable, skip: SkipImmutable, level: logrus.InfoLevel},
 		{err: fileutil.ErrNoSpace, failed: 1, level: logrus.ErrorLevel, stopped: NoSpace, remaining: 2},
 	}
 	for _, tt := range tests {
@@ -259,6 +323,85 @@ func TestOutcomeOfEachError(t *testing.T) {
 				t.Errorf("log lines = %+v", lines)
 			}
 		})
+	}
+}
+
+// A quota error while there is still plenty of room on the filesystem can only be a per-user or
+// per-group quota, so that file is skipped and the run goes on. Otherwise the dataset or pool is
+// full and the run stops.
+func TestQuotaOrFullPool(t *testing.T) {
+	quota := fmt.Errorf("%w (its owner or group is over their quota): %w", fileutil.ErrNoSpace,
+		&os.PathError{Op: "chown", Path: "x", Err: syscall.EDQUOT})
+	full := fmt.Errorf("%w: %w", fileutil.ErrNoSpace, &os.PathError{Op: "write", Path: "x", Err: syscall.ENOSPC})
+	enough := func(need uint64) (uint64, error) { return need + 1, nil }
+
+	tests := []struct {
+		name     string
+		err      error
+		free     func(need uint64) (uint64, error)
+		wantSkip bool
+	}{
+		{"owner over quota", quota, enough, true},
+		{"quota with no room left", quota, func(need uint64) (uint64, error) { return need, nil }, false},
+		{"room unknown", quota, func(uint64) (uint64, error) { return 0, errors.New("statfs failed") }, false},
+		{"pool full", full, enough, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := tempRoot(t)
+			writeFile(t, root, "sub/a", randomBytes(200<<10))
+			writeFile(t, root, "b", []byte("b"))
+			writeFile(t, root, "c", []byte("c"))
+			stubReplace(t, "sub/a", tt.err)
+			r, logs := newRebalancer(t, Config{Root: root, Concurrency: 1})
+			p := scan(t, r)
+			var alloc int64 = -1
+			for _, it := range p.Items {
+				if it.Names[0] == "sub/a" {
+					alloc = it.Allocated
+				}
+			}
+			if alloc < 0 {
+				t.Fatalf("sub/a isn't in the plan: %+v", p.Items)
+			}
+			var asked []string
+			t.Cleanup(func() { freeBytes = folderFreeBytes })
+			freeBytes = func(_ *os.Root, dir string) (uint64, error) {
+				asked = append(asked, dir)
+				return tt.free(2*uint64(alloc) + quotaMargin)
+			}
+
+			s := execute(t, context.Background(), r, p)
+			if want := map[bool]string{true: "[sub]", false: "[]"}[tt.err == quota]; fmt.Sprint(asked) != want {
+				t.Errorf("free space checked in %q, want %s", asked, want)
+			}
+			if tt.wantSkip {
+				if s.Skipped[SkipQuota] != 1 || s.Failed != 0 || s.Stopped != None || s.Rebalanced != 2 {
+					t.Errorf("summary = %+v", s)
+				}
+				if sk := logs.op("skipped"); len(sk) != 1 || sk[0].level != logrus.WarnLevel || sk[0].data["reason"] != reasonOverQuota {
+					t.Errorf("skipped log lines = %+v", sk)
+				}
+				return
+			}
+			if s.Failed != 1 || s.Stopped != NoSpace || s.Skipped[SkipQuota] != 0 {
+				t.Errorf("summary = %+v", s)
+			}
+		})
+	}
+}
+
+func TestFolderFreeBytes(t *testing.T) {
+	root := tempRoot(t)
+	writeFile(t, root, "sub/f", []byte("x"))
+	r, _ := newRebalancer(t, Config{Root: root})
+	for _, dir := range []string{".", "sub"} {
+		if free, err := folderFreeBytes(r.root, dir); err != nil || free == 0 {
+			t.Errorf("%s: free space %d, %v", dir, free, err)
+		}
+	}
+	if _, err := folderFreeBytes(r.root, "missing"); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("missing folder: %v", err)
 	}
 }
 
@@ -372,6 +515,76 @@ func TestFolderTimesRestoredAfterStop(t *testing.T) {
 	}
 	if got := lstatInfo(t, filepath.Join(root, "d")).Mtime; !got.Equal(old) {
 		t.Errorf("modified time %v, want %v", got, old)
+	}
+}
+
+// callbackState is an in-memory StateStore that runs a function when a given file is recorded as
+// done, which is after its rewrite has finished and before its folder's times are put back.
+type callbackState struct {
+	memoryState
+	on map[string]func()
+}
+
+func (c *callbackState) Increment(rel string) (int, error) {
+	n, err := c.memoryState.Increment(rel)
+	if f := c.on[rel]; f != nil {
+		f()
+	}
+	return n, err
+}
+
+// A folder another program changes while the run is using it keeps its new time, so tools that
+// look at folder times (media servers, backups) still notice the change. Here the change is a new
+// file, as a download would add, at each point the run can tell it apart from its own changes.
+func TestFolderTimesKeptWhenAnotherProgramChangesTheFolder(t *testing.T) {
+	old := time.Date(2000, 1, 2, 3, 4, 5, 0, time.UTC)
+	for _, when := range []string{"after the scan", "between two of the run's files", "after the run's last file"} {
+		t.Run(when, func(t *testing.T) {
+			root := tempRoot(t)
+			for _, rel := range []string{"media/a.mkv", "media/b.mkv", "other/c.mkv"} {
+				writeFile(t, root, rel, randomBytes(32<<10))
+			}
+			for _, dir := range []string{"media", "other"} {
+				if err := os.Chtimes(filepath.Join(root, dir), old, old); err != nil {
+					t.Fatal(err)
+				}
+			}
+			download := func() { writeFile(t, root, "media/new-episode.mkv", []byte("new")) }
+			state := &callbackState{memoryState: memoryState{counts: map[string]int{}}, on: map[string]func(){}}
+			r, logs := newRebalancer(t, Config{Root: root, Concurrency: 1, State: state})
+			p := scan(t, r)
+			switch when {
+			case "after the scan":
+				download()
+			case "between two of the run's files":
+				state.on["media/a.mkv"] = download
+			default:
+				state.on["media/b.mkv"] = download
+			}
+
+			s := execute(t, context.Background(), r, p)
+			if s.Rebalanced != 3 || s.FolderTimesNotRestored != 0 {
+				t.Errorf("summary = %+v", s)
+			}
+			if got := lstatInfo(t, filepath.Join(root, "media")).Mtime; got.Equal(old) {
+				t.Error("media's modified time was put back, hiding the new file from tools that look at it")
+			}
+			if got := lstatInfo(t, filepath.Join(root, "other")).Mtime; !got.Equal(old) {
+				t.Errorf("other's modified time is %v, want it put back to %v", got, old)
+			}
+			var left []logEntry
+			for _, e := range logs.about("media") {
+				if strings.Contains(e.msg, "another program changed") {
+					left = append(left, e)
+				}
+			}
+			if len(left) != 1 || left[0].level != logrus.DebugLevel {
+				t.Errorf("log lines about leaving media's times = %+v", left)
+			}
+			if w := logs.op("warning"); len(w) != 0 {
+				t.Errorf("warnings = %+v", w)
+			}
+		})
 	}
 }
 
