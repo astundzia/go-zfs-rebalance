@@ -89,7 +89,11 @@ func logSummary(log *logrus.Logger, s rebalance.Summary, o options) {
 	case rebalance.MissingFile:
 		log.Warnf("Stopped after %s because a file went missing (--halt-on-missing): %s.", took, rebalancedText(s))
 	case rebalance.NoSpace:
-		log.Warnf("Stopped after %s because the pool ran out of free space: %s.", took, rebalancedText(s))
+		if s.QuotaReached {
+			log.Warnf("Stopped after %s because a quota was reached: %s.", took, rebalancedText(s))
+		} else {
+			log.Warnf("Stopped after %s because the pool ran out of free space: %s.", took, rebalancedText(s))
+		}
 	}
 	if line := skippedText(s.Skipped); line != "" {
 		log.Info(line)
@@ -101,12 +105,18 @@ func logSummary(log *logrus.Logger, s rebalance.Summary, o options) {
 		log.Warnf("Couldn't put back the modified time of %s, so %s when the run changed %s — see the warnings above.",
 			choose(n, "1 folder", thousands(n)+" folders"), choose(n, "it shows", "they show"), choose(n, "it", "them"))
 	}
+	if n := s.FoldersChangedByOthers; n > 0 {
+		log.Infof("%s changed by another program during the run, so %s times were left as they are.",
+			choose(n, "1 folder was", thousands(n)+" folders were"), choose(n, "its", "their"))
+	}
 
 	again := "run the same command again with --resume added"
 	if o.resume {
 		again = "run the same command again"
 	}
 	switch {
+	case s.Stopped == rebalance.NoSpace && s.QuotaReached:
+		log.Infof("Raise the quota (on this dataset, a dataset above it, or the files' owner or group) or free up some space, then %s to finish the rest.", again)
 	case s.Stopped == rebalance.NoSpace:
 		log.Infof("Free up some space, then %s to finish the rest.", again)
 	case s.Stopped != rebalance.None:
@@ -115,6 +125,7 @@ func logSummary(log *logrus.Logger, s rebalance.Summary, o options) {
 		log.Infof("To try those files again, %s.", again)
 	}
 	if n := s.Skipped[rebalance.SkipHardlinked]; n > 0 {
+		listHardlinked(log, s.Hardlinked)
 		log.Infof("To include the %s with hardlinks, add --process-hardlinks.", countFiles(n))
 	}
 	if n := s.Skipped[rebalance.SkipBusy]; n > 0 {
@@ -122,6 +133,26 @@ func logSummary(log *logrus.Logger, s rebalance.Summary, o options) {
 	}
 	if hint := sudoHint(s.Skipped); hint != "" {
 		log.Info(hint)
+	}
+}
+
+// listHardlinked names the hardlinked files a run without --process-hardlinks left alone, the
+// first maxListed of them.
+func listHardlinked(log *logrus.Logger, names []string) {
+	n := len(names)
+	if n == 0 {
+		return
+	}
+	log.Info(choose(n, "This file has hardlinks, so it was left alone:", "These files have hardlinks, so they were left alone:"))
+	shown := n
+	if !log.IsLevelEnabled(logrus.DebugLevel) {
+		shown = min(n, maxListed) // --debug lists them all
+	}
+	for _, rel := range names[:shown] {
+		log.WithFields(logrus.Fields{"op": opListed, "path": rel}).Info()
+	}
+	if n > shown {
+		log.Infof("…and %s more (--debug lists them all)", thousands(n-shown))
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -389,8 +390,41 @@ func TestQuotaOrFullPool(t *testing.T) {
 				}
 				return
 			}
-			if s.Failed != 1 || s.Stopped != NoSpace || s.Skipped[SkipQuota] != 0 {
+			// The end of the run says whether a quota or the pool itself ran out.
+			if s.Failed != 1 || s.Stopped != NoSpace || s.Skipped[SkipQuota] != 0 || s.QuotaReached != (tt.err == quota) {
 				t.Errorf("summary = %+v", s)
+			}
+		})
+	}
+}
+
+// Only the error that stopped the run decides whether the stop was down to a quota.
+func TestQuotaReachedOnlyForTheStoppingError(t *testing.T) {
+	quota := fmt.Errorf("%w: %w", fileutil.ErrNoSpace, &os.PathError{Op: "write", Path: "x", Err: syscall.EDQUOT})
+	full := fmt.Errorf("%w: %w", fileutil.ErrNoSpace, &os.PathError{Op: "write", Path: "x", Err: syscall.ENOSPC})
+	tests := []struct {
+		name  string
+		first error
+		then  StopReason
+		want  bool
+	}{
+		{"quota", quota, None, true},
+		{"pool full", full, None, false},
+		{"quota after being asked to stop", quota, Interrupted, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, _ := newRebalancer(t, Config{Root: tempRoot(t)})
+			if tt.then != None {
+				r.stopWith(tt.then)
+			}
+			r.stopForSpace(tt.first)
+			r.stopForSpace(full) // a later error doesn't change it
+			if got := StopReason(r.reason.Load()); tt.then == None && got != NoSpace {
+				t.Errorf("stop reason = %v", got)
+			}
+			if got := r.quotaReached.Load(); got != tt.want {
+				t.Errorf("quota reached = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -573,7 +607,7 @@ func TestFolderTimesKeptWhenAnotherProgramChangesTheFolder(t *testing.T) {
 			}
 
 			s := execute(t, context.Background(), r, p)
-			if s.Rebalanced != 3 || s.FolderTimesNotRestored != 0 {
+			if s.Rebalanced != 3 || s.FolderTimesNotRestored != 0 || s.FoldersChangedByOthers != 1 {
 				t.Errorf("summary = %+v", s)
 			}
 			if got := lstatInfo(t, filepath.Join(root, "media")).Mtime; got.Equal(old) {
@@ -623,6 +657,11 @@ func TestLargeTree(t *testing.T) {
 	if s.Rebalanced != len(before) || s.Failed != 0 || s.Bytes != p.TotalBytes {
 		t.Errorf("summary = %+v, %d files, %d bytes planned", s, len(before), p.TotalBytes)
 	}
+	// Several files at once in the same folders are still all the run's own doing.
+	if s.FoldersChangedByOthers != 0 || s.FolderTimesNotRestored != 0 {
+		t.Errorf("folders changed by others %d, folder times not put back %d; want 0 and 0",
+			s.FoldersChangedByOthers, s.FolderTimesNotRestored)
+	}
 	after := snapshot(t, root)
 	for rel := range before {
 		checkRewritten(t, before, after, rel)
@@ -660,8 +699,9 @@ func TestStampSame(t *testing.T) {
 }
 
 // After a run stops because the dataset is full or at its quota, ZFS frees the abandoned copies'
-// space a little later, and until then even setting a folder's times fails. The run waits a
-// little for that before giving up, but never for long in all.
+// space a little later, and until then even setting a folder's times fails. The run asks the
+// filesystem to write out what it holds, then waits a little for the space before giving up, but
+// never for long in all.
 func TestFolderTimesWaitForSpace(t *testing.T) {
 	old := time.Date(2000, 1, 2, 3, 4, 5, 0, time.UTC)
 	tests := []struct {
@@ -669,12 +709,14 @@ func TestFolderTimesWaitForSpace(t *testing.T) {
 		err      error
 		failures int // how many attempts fail before the space is freed; -1 if it never is
 		calls    map[string]int
+		synced   []string // the folders whose filesystem was asked to write out what it holds
 		warned   int
 	}{
-		{"quota frees up", syscall.EDQUOT, 2, map[string]int{"a": 3, "b": 1}, 0},
-		{"pool frees up", syscall.ENOSPC, 1, map[string]int{"a": 2, "b": 1}, 0},
-		{"never frees up", syscall.EDQUOT, -1, map[string]int{"a": 4, "b": 2}, 2},
-		{"refused", syscall.EPERM, -1, map[string]int{"a": 1, "b": 1}, 2},
+		{"quota frees up", syscall.EDQUOT, 2, map[string]int{"a": 3, "b": 1}, []string{"a"}, 0},
+		{"pool frees up", syscall.ENOSPC, 1, map[string]int{"a": 2, "b": 1}, []string{"a"}, 0},
+		// b still gets one try after the wait, and a sync, since a used only 3 ms of the 4.
+		{"never frees up", syscall.EDQUOT, -1, map[string]int{"a": 4, "b": 2}, []string{"a", "b"}, 2},
+		{"refused", syscall.EPERM, -1, map[string]int{"a": 1, "b": 1}, nil, 2},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -688,9 +730,16 @@ func TestFolderTimesWaitForSpace(t *testing.T) {
 				}
 			}
 			delays, budget := noSpaceDelays, noSpaceBudget
-			t.Cleanup(func() { noSpaceDelays, noSpaceBudget, setFolderTimes = delays, budget, fileutil.SetTimes })
+			t.Cleanup(func() {
+				noSpaceDelays, noSpaceBudget, setFolderTimes, syncFS = delays, budget, fileutil.SetTimes, syncFilesystem
+			})
 			noSpaceDelays = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
 			noSpaceBudget = 4 * time.Millisecond
+			var synced []string
+			syncFS = func(d *os.File) error {
+				synced = append(synced, filepath.Base(d.Name()))
+				return syncFilesystem(d)
+			}
 			calls := map[string]int{}
 			failed := 0
 			setFolderTimes = func(d *os.File, atime, mtime time.Time) error {
@@ -711,6 +760,9 @@ func TestFolderTimesWaitForSpace(t *testing.T) {
 			if fmt.Sprint(calls) != fmt.Sprint(tt.calls) {
 				t.Errorf("attempts per folder = %v, want %v", calls, tt.calls)
 			}
+			if !slices.Equal(synced, tt.synced) {
+				t.Errorf("filesystem synced for %q, want %q", synced, tt.synced)
+			}
 			if w := logs.op("warning"); len(w) != tt.warned {
 				t.Errorf("warnings = %+v", w)
 			}
@@ -720,6 +772,33 @@ func TestFolderTimesWaitForSpace(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// ZFS gives back freed space when it writes out a transaction group, every 5 seconds by default,
+// and writing one out can take a while longer, so the wait for space must outlast two of them,
+// without any single pause being long.
+func TestNoSpaceWaitOutlastsTwoTransactionGroups(t *testing.T) {
+	var total time.Duration
+	for _, d := range noSpaceDelays {
+		if d <= 0 || d > 2*time.Second {
+			t.Errorf("a pause of %v, want between 0 and 2s", d)
+		}
+		total += d
+	}
+	if total != noSpaceBudget || noSpaceBudget < 2*5*time.Second {
+		t.Errorf("pauses add up to %v and the budget is %v; want them equal and at least 10s", total, noSpaceBudget)
+	}
+}
+
+func TestSyncFilesystem(t *testing.T) {
+	d, err := os.Open(tempRoot(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if err := syncFilesystem(d); err != nil {
+		t.Errorf("syncFilesystem = %v", err)
 	}
 }
 

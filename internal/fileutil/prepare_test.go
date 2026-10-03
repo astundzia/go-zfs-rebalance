@@ -445,3 +445,48 @@ func TestInfoBlocks(t *testing.T) {
 	}
 	require.Less(t, mustLstat(t, root, "sparse").Blocks, int64(1<<20))
 }
+
+// A share whose ACL mode is "restricted" refuses to chmod a file with ACL entries of its own, so
+// the setuid and setgid bits can't be put back on its copy. That case gets its own plain words;
+// every other failure to set the mode keeps the general ones.
+func TestChmodErr(t *testing.T) {
+	const suid, sgid = fs.ModeSetuid, fs.ModeSetgid
+	withACL := wantedMeta{xattrs: map[string][]byte{"system.nfs4_acl_xdr": {1}}, acl: []byte{1}}
+	noACL := wantedMeta{xattrs: map[string][]byte{"user.note": {1}}}
+	general := func(errno syscall.Errno) string {
+		return "couldn't keep the file's permissions, attributes or timestamps exactly (permissions: " + errno.Error() + ") — nothing was changed"
+	}
+	specific := func(bits string) string {
+		return "its " + bits + " can't be put back on a copy while the file has ACL entries of its own " +
+			"(this share's ACL mode doesn't allow it), so it was left alone — nothing was changed"
+	}
+	tests := []struct {
+		name      string
+		errno     syscall.Errno
+		orig, cur fs.FileMode
+		want      wantedMeta
+		message   string
+	}{
+		{"setuid", syscall.EPERM, 0o755 | suid, 0o755, withACL, specific("setuid bit")},
+		{"setgid", syscall.EPERM, 0o750 | sgid, 0o750, withACL, specific("setgid bit")},
+		{"both", syscall.EPERM, 0o755 | suid | sgid, 0o755, withACL, specific("setuid and setgid bits")},
+		{"only one missing", syscall.EPERM, 0o755 | suid | sgid, 0o755 | sgid, withACL, specific("setuid bit")},
+		{"no ACL", syscall.EPERM, 0o755 | suid, 0o755, noACL, general(syscall.EPERM)},
+		{"other bits differ too", syscall.EPERM, 0o755 | suid, 0o700, withACL, general(syscall.EPERM)},
+		{"not refused for the ACL", syscall.EACCES, 0o755 | suid, 0o755, withACL, general(syscall.EACCES)},
+		{"no setuid or setgid", syscall.EPERM, 0o644, 0o600, withACL, general(syscall.EPERM)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cause := &fs.PathError{Op: "fchmod", Path: "dir/.zfs-rebalance.0123456789ab.tmp", Err: tt.errno}
+			err := chmodErr(cause, Info{Mode: tt.orig}, Info{Mode: tt.cur}, tt.want)
+			require.ErrorIs(t, err, ErrMetadata)
+			require.ErrorIs(t, err, tt.errno)
+			require.Equal(t, tt.message, err.Error())
+		})
+	}
+	// Running out of space while setting the mode is still running out of space.
+	err := chmodErr(&fs.PathError{Op: "fchmod", Path: "x", Err: syscall.ENOSPC}, Info{Mode: 0o755 | suid}, Info{Mode: 0o755}, withACL)
+	require.ErrorIs(t, err, ErrNoSpace)
+	require.NotErrorIs(t, err, ErrMetadata)
+}

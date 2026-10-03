@@ -22,7 +22,8 @@ const (
 	// freeWait is how long to wait for ZFS to release the old copies' space before the
 	// after-table, so the old vdevs show the space they got back.
 	freeWait = 2 * time.Minute
-	// maxListed is how many leftover .balance files are named in the warning about them.
+	// maxListed is how many files are named in a list of them, such as the leftover .balance
+	// files or the hardlinked files left alone; the rest are counted.
 	maxListed = 5
 )
 

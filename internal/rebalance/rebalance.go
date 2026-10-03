@@ -170,6 +170,9 @@ type Plan struct {
 	StaleTemps       []string           // temporary files left behind by an earlier run
 	LegacyBalance    []string           // files ending in ".balance", possibly left behind by version 1
 	OrphanBalance    []string           // the LegacyBalance files with no matching original; never rewritten
+	// Hardlinked names the files counted as SkipHardlinked (every name found of each), which a
+	// run without Config.ProcessHardlinks leaves alone. The names of one file are next to each other.
+	Hardlinked []string
 
 	dirs map[string]dirTimes // times of the folders the run will touch, to put back afterwards
 }
@@ -191,10 +194,21 @@ type Summary struct {
 	Bytes      int64              // bytes rewritten
 	Duration   time.Duration
 	Stopped    StopReason
+	// QuotaReached is set when the run stopped for lack of space (Stopped is NoSpace) because a
+	// quota ran out (EDQUOT): one on the dataset or a dataset above it, or the owner's or group's.
+	// Otherwise the pool itself was full (ENOSPC).
+	QuotaReached bool
+	// Hardlinked names the hardlinked files left alone because Config.ProcessHardlinks is off (see
+	// Plan.Hardlinked).
+	Hardlinked []string
 	// FolderTimesNotRestored counts folders whose modified time the run changed and couldn't put
 	// back (each is also logged as a warning). Folders another program changed during the run are
-	// left with their new time on purpose and aren't counted.
+	// left with their new time on purpose and counted in FoldersChangedByOthers instead.
 	FolderTimesNotRestored int
+	// FoldersChangedByOthers counts folders that another program (or another run) changed while
+	// the run was using them, whose times were therefore left as they are, so that tools which look
+	// at folder times still notice that change.
+	FoldersChangedByOthers int
 }
 
 // NothingNew explains a finished run that rewrote nothing new: some files were already done, and
@@ -261,9 +275,10 @@ type Rebalancer struct {
 	excludes exclusions
 	as       account // who the run works as
 
-	stopOnce sync.Once
-	stopCh   chan struct{}
-	reason   atomic.Int32 // StopReason; the first reason given wins
+	stopOnce     sync.Once
+	stopCh       chan struct{}
+	reason       atomic.Int32 // StopReason; the first reason given wins
+	quotaReached atomic.Bool  // the NoSpace stop came from a quota (see Summary.QuotaReached)
 
 	started                               atomic.Pointer[time.Time]
 	total, rebalanced, failed, skipped    atomic.Int64
@@ -342,9 +357,12 @@ func (r *Rebalancer) Close() error { return r.root.Close() }
 // a later Execute does nothing.
 func (r *Rebalancer) Stop() { r.stopWith(Interrupted) }
 
-func (r *Rebalancer) stopWith(reason StopReason) {
-	r.reason.CompareAndSwap(int32(None), int32(reason))
+// stopWith stops the run for reason, and reports whether that is the reason the run stopped: the
+// first reason given wins.
+func (r *Rebalancer) stopWith(reason StopReason) bool {
+	first := r.reason.CompareAndSwap(int32(None), int32(reason))
 	r.stopOnce.Do(func() { close(r.stopCh) })
+	return first
 }
 
 func (r *Rebalancer) stopping() bool {

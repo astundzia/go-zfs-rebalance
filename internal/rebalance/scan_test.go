@@ -171,13 +171,56 @@ func TestHardlinksSkippedByDefault(t *testing.T) {
 	before := snapshot(t, root)
 	r, _ := newRebalancer(t, Config{Root: root})
 
-	_, s := scanAndExecute(t, r)
+	p, s := scanAndExecute(t, r)
 	if s.Skipped[SkipHardlinked] != 2 || s.Rebalanced != 1 {
 		t.Errorf("summary = %+v", s)
+	}
+	// Each name is given, so the summary can say which files were left alone.
+	if want := []string{"a", "b"}; !slices.Equal(p.Hardlinked, want) || !slices.Equal(s.Hardlinked, want) {
+		t.Errorf("hardlinked names: plan %q, summary %q; want %q", p.Hardlinked, s.Hardlinked, want)
 	}
 	after := snapshot(t, root)
 	checkUntouched(t, before, after, "a", "b")
 	checkRewritten(t, before, after, "c")
+}
+
+// Once a run with ProcessHardlinks has rewritten a hardlinked file, a run without it counts the
+// file as already done, rather than as one it leaves alone for having hardlinks. A file it would
+// still leave alone, because one of its names is outside the folder, is named as before.
+func TestHardlinksAlreadyDoneWithoutProcessHardlinks(t *testing.T) {
+	base := tempRoot(t)
+	root := filepath.Join(base, "root")
+	writeFile(t, root, "pair/one", []byte("two names"))
+	writeFile(t, root, "later/first", []byte("a name added later"))
+	writeFile(t, root, "shared", []byte("one name outside"))
+	writeFile(t, root, "solo", []byte("alone"))
+	link := func(target, name string) {
+		t.Helper()
+		if err := os.Link(filepath.Join(base, target), filepath.Join(base, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link("root/pair/one", "root/pair/two")
+	link("root/later/first", "root/later/third")
+	link("root/shared", "outside")
+	state := &memoryState{counts: map[string]int{}}
+	r, _ := newRebalancer(t, Config{Root: root, ProcessHardlinks: true, State: state})
+	if _, s := scanAndExecute(t, r); s.Rebalanced != 5 || s.Skipped[SkipHardlinksOutside] != 1 {
+		t.Fatalf("first run: %+v", s)
+	}
+	link("root/later/first", "root/later/second")
+
+	r2, _ := newRebalancer(t, Config{Root: root, State: state})
+	p, s := scanAndExecute(t, r2)
+	// pair/one and pair/two, and the three names of later/first, one of them new. shared has a name
+	// outside the folder, so --process-hardlinks wouldn't include it either: it is reported as such,
+	// not listed under the hint.
+	if s.Skipped[SkipAlreadyDone] != 6 || s.Skipped[SkipHardlinksOutside] != 1 || s.Skipped[SkipHardlinked] != 0 || s.Total != 0 {
+		t.Errorf("summary = %+v", s)
+	}
+	if len(p.Hardlinked) != 0 {
+		t.Errorf("hardlinked names = %q, want none", p.Hardlinked)
+	}
 }
 
 func TestHardlinkGroupInsideRoot(t *testing.T) {

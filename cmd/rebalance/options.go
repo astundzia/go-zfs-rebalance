@@ -156,6 +156,11 @@ func parseArgs(args []string) (options, error) {
 	if o.help || o.version {
 		return o, nil
 	}
+	// Option values come first: an option missing its value takes the folder as its value, and
+	// its own error then says so, which is more use than saying the folder is missing.
+	if err := o.validate(len(paths) > 0); err != nil {
+		return o, err
+	}
 	switch len(paths) {
 	case 0:
 		return o, errors.New("please give the folder to rebalance, for example: rebalance /mnt/tank/media")
@@ -169,7 +174,7 @@ func parseArgs(args []string) (options, error) {
 		return o, fmt.Errorf("please give just one folder, not %d (%s). If a folder's name has spaces in it, put it in quotes",
 			len(paths), strings.Join(quoted, ", "))
 	}
-	return o, o.validate()
+	return o, nil
 }
 
 // endedWithTerminator reports whether flag parsing that consumed these arguments stopped at a "--",
@@ -282,8 +287,9 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-// validate checks option values that can be wrong even when they parse.
-func (o *options) validate() error {
+// validate checks option values that can be wrong even when they parse. haveFolder says whether a
+// folder was given, which decides whether a bad --checksum value could be the folder itself.
+func (o *options) validate(haveFolder bool) error {
 	switch {
 	case o.passes < 1:
 		return fmt.Errorf("--passes must be 1 or more (it was %d). A normal run already rewrites every file once, which is --passes 1, the default", o.passes)
@@ -293,11 +299,29 @@ func (o *options) validate() error {
 		return fmt.Errorf("--size-threshold can't be negative (it was %d). Leave it out, or use 0, to list every file", o.sizeThresholdMB)
 	}
 	sum, err := fileutil.ParseChecksumType(o.checksum)
-	if err != nil {
+	switch {
+	case err != nil && looksLikePath(o.checksum, haveFolder):
+		return fmt.Errorf("--checksum needs sha256 (the default) or md5 — it looks like the folder %q was taken as its value. "+
+			"Put sha256 or md5 right after --checksum, or leave --checksum out", o.checksum)
+	case err != nil:
 		return fmt.Errorf("--checksum needs sha256 (the default) or md5, not %q", o.checksum)
 	}
 	o.checksumType = sum
 	return nil
+}
+
+// looksLikePath reports whether an option's value is more likely a folder than a value for the
+// option: it names a folder that exists, starts like a path, or (when no folder was given at all)
+// has a slash in it.
+func looksLikePath(value string, haveFolder bool) bool {
+	if fi, err := os.Stat(value); err == nil && fi.IsDir() {
+		return true
+	}
+	if strings.HasPrefix(value, "/") || strings.HasPrefix(value, "./") || strings.HasPrefix(value, "~") {
+		return true
+	}
+	// A "/" elsewhere (say "sha256/md5") only suggests a folder when no folder was given at all.
+	return !haveFolder && strings.Contains(value, "/")
 }
 
 // resolveConcurrency turns --concurrency into the number of files to work on at once. 0 means

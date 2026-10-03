@@ -541,8 +541,9 @@ func TestLeftoversAreReported(t *testing.T) {
 	}
 }
 
-// TestHardlinkedNamesAreShown checks that a rewritten hardlinked file's line shows its other names
-// without --debug, and that without --process-hardlinks it is skipped with a hint.
+// TestHardlinkedNamesAreShown checks that without --process-hardlinks a hardlinked file is skipped
+// and named, with a hint; that a rewritten hardlinked file's line shows its other names without
+// --debug; and that once rewritten, a resumed run without the option counts it as already done.
 func TestHardlinkedNamesAreShown(t *testing.T) {
 	isolateState(t)
 	root := makeTree(t, "a", "links/b")
@@ -555,7 +556,11 @@ func TestHardlinkedNamesAreShown(t *testing.T) {
 	if code != exitOK {
 		t.Fatalf("exit %d, want 0", code)
 	}
-	mustContain(t, errOut, "rebalanced 1 file", "Skipped 5 files: 5 hardlinked.", "To include the 5 files with hardlinks, add --process-hardlinks.")
+	mustContain(t, errOut, "rebalanced 1 file", "Skipped 5 files: 5 hardlinked.",
+		"These files have hardlinks, so they were left alone:\n",
+		"      links/b\n", "      links/c\n", "      links/d\n", "      links/e\n", "      z\n",
+		"To include the 5 files with hardlinks, add --process-hardlinks.")
+	mustNotContain(t, errOut, "more")
 
 	code, _, errOut = runCLI(t, root, "--no-random", "--process-hardlinks")
 	if code != exitOK {
@@ -563,6 +568,13 @@ func TestHardlinkedNamesAreShown(t *testing.T) {
 	}
 	mustContain(t, errOut, "✓ rebalanced  links/b (also named links/c, links/d, links/e, +1 more)  ", "rebalanced 6 files")
 	mustNotContain(t, errOut, "      also z")
+
+	code, _, errOut = runCLI(t, root, "--resume")
+	if code != exitOK {
+		t.Fatalf("exit %d, want 0", code)
+	}
+	mustContain(t, errOut, "Skipped 6 files: 6 already done.")
+	mustNotContain(t, errOut, "hardlinked", "--process-hardlinks")
 }
 
 func TestFolderNameStartingWithADash(t *testing.T) {

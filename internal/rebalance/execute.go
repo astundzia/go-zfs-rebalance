@@ -18,23 +18,29 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// Test seams. replace rewrites one item, freeBytes says how much room is left in a folder and
-// setFolderTimes puts back a folder's times; tests swap them to simulate failures, such as a full
-// pool, that are hard to cause for real.
+// Test seams. replace rewrites one item, freeBytes says how much room is left in a folder,
+// setFolderTimes puts back a folder's times and syncFS asks a folder's filesystem to write out
+// what it is holding; tests swap them to simulate failures, such as a full pool, that are hard to
+// cause for real.
 var (
 	replace        = fileutil.ReplaceGroup
 	freeBytes      = folderFreeBytes
 	setFolderTimes = fileutil.SetTimes
+	syncFS         = syncFilesystem
 )
 
 // When putting back a folder's times fails because the filesystem is out of space or over quota,
-// it is tried again after each of noSpaceDelays: after a run stops for lack of space, ZFS frees the
-// abandoned copies' space a few seconds later. All the folders of a run share noSpaceBudget of
-// waiting, so a dataset that stays full can't hold up the end of the run for long.
+// the filesystem is asked to write out what it is holding (syncfs on Linux), in case that frees the
+// space sooner, and the times are tried again after each of noSpaceDelays. After a run stops for
+// lack of space, ZFS only gives back the abandoned copies' space once it has written out its next
+// transaction group, which it does every 5 seconds (zfs_txg_timeout) and which can then take a
+// while longer. All the folders of a run share noSpaceBudget of waiting, so a dataset that stays
+// full can't hold up the end of the run for long.
 var (
 	noSpaceDelays = []time.Duration{100 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond,
-		800 * time.Millisecond, 1500 * time.Millisecond, 2 * time.Second}
-	noSpaceBudget = 5 * time.Second
+		800 * time.Millisecond, 1500 * time.Millisecond, 2 * time.Second, 2 * time.Second, 2 * time.Second,
+		2 * time.Second, 2 * time.Second, 2 * time.Second}
+	noSpaceBudget = 15 * time.Second
 )
 
 // quotaMargin is how much free space, beyond twice the file's size on disk, the filesystem must
@@ -56,8 +62,8 @@ const (
 // copied are abandoned and left as they were), the pool runs out of space, or a file goes missing
 // and Config.HaltOnMissing is set; Summary.Stopped says which. Folder timestamps changed by the run
 // are put back as each folder is finished, and at the end for any left over, unless another
-// program changed the folder in the meantime; a filesystem that is out of space is given a few
-// seconds to free some first.
+// program changed the folder in the meantime (Summary.FoldersChangedByOthers counts those); a
+// filesystem that is out of space is given up to noSpaceBudget in all to free some first.
 //
 // Problems with single files are reported in the Summary and the log, not as an error. Scan again
 // before each Execute: running the same Plan twice rewrites its files twice.
@@ -72,6 +78,7 @@ func (r *Rebalancer) Execute(ctx context.Context, p *Plan) (Summary, error) {
 		plan:    p,
 		folders: make(map[string]*folder),
 		skipped: make(map[SkipReason]int),
+		hard:    ctx,
 	}
 	for _, it := range p.Items {
 		for _, dir := range itemDirs(it) {
@@ -136,8 +143,10 @@ type execution struct {
 	folders          map[string]*folder
 	skipped          map[SkipReason]int
 	timesNotRestored int
+	changedByOthers  int // folders whose times were left alone because another program changed them
 
-	spaceWaited atomic.Int64 // time spent waiting for space to put back folder times, in nanoseconds
+	spaceWaited atomic.Int64    // time spent waiting for space to put back folder times, in nanoseconds
+	hard        context.Context // cancelled by a hard stop, which also ends any wait for space
 }
 
 // folder is what the run knows about a folder it works in. Its times are put back once the run is
@@ -228,7 +237,7 @@ func (x *execution) outcome(it Item, res fileutil.Result, err error) {
 		// this needs a person's attention whatever stopped it.
 		x.failed(it, "Couldn't finish switching this file's hardlinked names", err)
 		if errors.Is(err, fileutil.ErrNoSpace) {
-			r.stopWith(NoSpace)
+			r.stopForSpace(err)
 		}
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		// Abandoned part-way: the file is as it was, and a resumed run will pick it up.
@@ -240,7 +249,7 @@ func (x *execution) outcome(it Item, res fileutil.Result, err error) {
 			return
 		}
 		x.failed(it, "Ran out of free space, so the run is stopping", err)
-		r.stopWith(NoSpace)
+		r.stopForSpace(err)
 	case errors.Is(err, fileutil.ErrBusy):
 		x.skip(it, SkipBusy, err.Error(), logrus.InfoLevel)
 	case errors.Is(err, fileutil.ErrUndeletable):
@@ -274,6 +283,14 @@ func (x *execution) outcome(it Item, res fileutil.Result, err error) {
 		x.skip(it, SkipNoPermission, reasonNoPermission, logrus.InfoLevel)
 	default:
 		x.failed(it, "Couldn't rebalance", err)
+	}
+}
+
+// stopForSpace stops the run because err says the filesystem ran out of space. If that is what
+// stopped it, it also notes whether a quota (EDQUOT) was the limit, rather than the pool (ENOSPC).
+func (r *Rebalancer) stopForSpace(err error) {
+	if r.stopWith(NoSpace) {
+		r.quotaReached.Store(errors.Is(err, syscall.EDQUOT))
 	}
 }
 
@@ -507,6 +524,9 @@ func (x *execution) restoreDir(dir string, f folder) {
 		return
 	}
 	if f.foreign || !f.last.same(stampOf(now)) {
+		x.mu.Lock()
+		x.changedByOthers++
+		x.mu.Unlock()
 		log.WithField("path", dir).Debug("Left this folder's times as they are, because another program changed the folder during the run")
 		return
 	}
@@ -531,17 +551,32 @@ func (x *execution) restoreDir(dir string, f folder) {
 // setDirTimes sets the times of the open folder d, trying again for a while if the filesystem is
 // out of space or over quota (see noSpaceDelays).
 func (x *execution) setDirTimes(d *os.File, atime, mtime time.Time) error {
-	for _, delay := range noSpaceDelays {
-		err := setFolderTimes(d, atime, mtime)
-		if !errors.Is(err, syscall.EDQUOT) && !errors.Is(err, syscall.ENOSPC) {
-			return err
-		}
-		if x.spaceWaited.Add(int64(delay)) > int64(noSpaceBudget) {
-			return err
-		}
-		time.Sleep(delay)
+	err := setFolderTimes(d, atime, mtime)
+	if !outOfSpace(err) || x.spaceWaited.Load() >= int64(noSpaceBudget) {
+		return err
 	}
-	return setFolderTimes(d, atime, mtime)
+	if serr := syncFS(d); serr != nil {
+		x.r.log.WithField("reason", reasonOf(serr)).Debug("Couldn't ask the filesystem to write out its changes")
+	}
+	for _, delay := range noSpaceDelays {
+		if x.spaceWaited.Add(int64(delay)) > int64(noSpaceBudget) {
+			break
+		}
+		select {
+		case <-time.After(delay):
+		case <-x.hard.Done():
+			return err
+		}
+		if err = setFolderTimes(d, atime, mtime); !outOfSpace(err) {
+			break
+		}
+	}
+	return err
+}
+
+// outOfSpace reports whether err means the filesystem is full or over a quota.
+func outOfSpace(err error) bool {
+	return errors.Is(err, syscall.EDQUOT) || errors.Is(err, syscall.ENOSPC)
 }
 
 func (x *execution) summary(ctx context.Context, start time.Time) Summary {
@@ -554,7 +589,9 @@ func (x *execution) summary(ctx context.Context, start time.Time) Summary {
 		Bytes:      r.bytesRewritten.Load(),
 		Duration:   time.Since(start),
 		Stopped:    StopReason(r.reason.Load()),
+		Hardlinked: x.plan.Hardlinked,
 	}
+	s.QuotaReached = s.Stopped == NoSpace && r.quotaReached.Load()
 	for why, n := range x.plan.Skipped {
 		s.Skipped[why] += n
 	}
@@ -566,6 +603,7 @@ func (x *execution) summary(ctx context.Context, start time.Time) Summary {
 		runSkipped += n
 	}
 	s.FolderTimesNotRestored = x.timesNotRestored
+	s.FoldersChangedByOthers = x.changedByOthers
 	x.mu.Unlock()
 	s.Remaining = s.Total - s.Rebalanced - s.Failed - runSkipped
 	switch {

@@ -119,6 +119,16 @@ func TestParseArgsErrors(t *testing.T) {
 		{"old option given a value", []string{"/a", "-no-cleanup-balance=sometimes"},
 			`-no-cleanup-balance is an on/off option: give it on its own, without "=sometimes"`},
 		{"unknown checksum", []string{"--checksum", "foo", "/a"}, `--checksum needs sha256 (the default) or md5, not "foo"`},
+		// --checksum given no value takes the folder as its value, and says so rather than asking
+		// for a folder.
+		{"checksum took the folder", []string{"--checksum", "/tank/data/share"},
+			`--checksum needs sha256 (the default) or md5 — it looks like the folder "/tank/data/share" was taken as its value. ` +
+				"Put sha256 or md5 right after --checksum, or leave --checksum out"},
+		{"checksum with a slash but a folder given", []string{"--checksum", "sha256/md5", "/a"}, `--checksum needs sha256 (the default) or md5, not "sha256/md5"`},
+		{"checksum took the first of two folders", []string{"--checksum", "/a", "/b"}, `it looks like the folder "/a" was taken as its value`},
+		{"checksum took a folder here", []string{"--debug", "--checksum", "."}, `it looks like the folder "." was taken as its value`},
+		{"a bad value before a missing folder", []string{"--passes", "0"}, "--passes must be 1 or more"},
+		{"unknown checksum and no folder", []string{"--checksum", "sha1"}, `--checksum needs sha256 (the default) or md5, not "sha1"`},
 		{"negative size threshold", []string{"--size-threshold", "-1", "/a"}, "--size-threshold can't be negative"},
 		{"negative concurrency", []string{"--concurrency", "-1", "/a"}, "--concurrency can't be negative"},
 		{"unknown option", []string{"--frobnicate", "/a"}, "there's no option called --frobnicate"},

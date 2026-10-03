@@ -126,7 +126,7 @@ func finishTemp(tmp *os.File, orig Info, want wantedMeta) error {
 	}
 	if cur.Mode != orig.Mode {
 		if err := tmp.Chmod(orig.Mode & permBits); err != nil {
-			return failKind(ErrMetadata, "permissions: "+reason(err), err)
+			return chmodErr(err, orig, cur, want)
 		}
 	}
 
@@ -142,6 +142,41 @@ func finishTemp(tmp *os.File, orig Info, want wantedMeta) error {
 		return err
 	}
 	return verifyMetadata(tmp, orig, want)
+}
+
+// chmodErr describes a failure to give the copy cur the original's full mode. A share whose NFSv4
+// ACLs are in "restricted" mode (TrueNAS SMB shares) refuses chmod (EPERM) on a file with ACL
+// entries of its own, so the setuid and setgid bits, which only chmod can set, can't be put back
+// on its copy; that case is explained on its own.
+func chmodErr(err error, orig, cur Info, want wantedMeta) error {
+	const setid = fs.ModeSetuid | fs.ModeSetgid
+	missing := orig.Mode & setid &^ cur.Mode
+	if !errors.Is(err, syscall.EPERM) || missing == 0 || (orig.Mode^cur.Mode)&^setid != 0 || !want.hasACL() {
+		return failKind(ErrMetadata, "permissions: "+reason(err), err)
+	}
+	bits := "setuid bit"
+	switch missing {
+	case fs.ModeSetgid:
+		bits = "setgid bit"
+	case setid:
+		bits = "setuid and setgid bits"
+	}
+	return &failure{
+		kind:  ErrMetadata.(*sentinel),
+		what:  "its " + bits + " can't be put back on a copy while the file has ACL entries of its own (this share's ACL mode doesn't allow it), so it was left alone",
+		cause: err,
+	}
+}
+
+// hasACL reports whether the original has an ACL: on Linux one stored as an extended attribute,
+// on macOS its own.
+func (w wantedMeta) hasACL() bool {
+	for name := range w.xattrs {
+		if isACLXattr(name) {
+			return true
+		}
+	}
+	return len(w.acl) > 0
 }
 
 // timeAttempts bounds how often keepTimes puts the times back while something keeps reading the file.

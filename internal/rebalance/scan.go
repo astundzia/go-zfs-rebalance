@@ -23,7 +23,9 @@ const legacySuffix = ".balance"
 // anything else that isn't a regular file. Temporary files left by an earlier run go into
 // Plan.StaleTemps. Files that are already done (Config.Passes), hardlinked files that can't be
 // handled and, without root, files owned by someone else or in a group the user isn't in are
-// counted in Plan.Skipped. If ctx is cancelled the walk stops and ctx.Err() is returned.
+// counted in Plan.Skipped. Without Config.ProcessHardlinks, the hardlinked files left alone are
+// named in Plan.Hardlinked; one that is already done counts as that instead. If ctx is cancelled
+// the walk stops and ctx.Err() is returned.
 func (r *Rebalancer) Scan(ctx context.Context) (*Plan, error) {
 	counts, err := r.state.Counts()
 	if err != nil {
@@ -132,11 +134,9 @@ func (s *scanner) visit(rel string, d fs.DirEntry, err error) error {
 		return nil
 	}
 
+	// Every name found of a hardlinked file is gathered, even when hardlinked files are left alone:
+	// finish needs them all to tell whether the file is already done.
 	if info.Nlink > 1 {
-		if !s.r.cfg.ProcessHardlinks {
-			s.plan.Skipped[SkipHardlinked]++
-			return nil
-		}
 		g, ok := s.groups[info.ID]
 		if !ok {
 			g = linkGroup{index: len(s.items), nlink: info.Nlink}
@@ -153,30 +153,32 @@ func (s *scanner) visit(rel string, d fs.DirEntry, err error) error {
 // finish drops what can't or needn't be done, fills in the totals and orders the work.
 func (s *scanner) finish(counts map[string]int) {
 	p := s.plan
-	// A hardlinked file with names outside the folder (or being changed right now) is left alone:
-	// rewriting only some of its names would split it into two separate copies. Each name found
-	// is logged, so the user can find the file and point the run at a folder holding all of them.
-	incomplete := make(map[int]uint64)
+	nlinks := make(map[int]uint64, len(s.groups)) // the link count of each hardlinked item, by index
 	for _, g := range s.groups {
-		if uint64(len(s.items[g.index].Names)) != g.nlink {
-			incomplete[g.index] = g.nlink
-		}
+		nlinks[g.index] = g.nlink
 	}
 	for i, it := range s.items {
-		if nlink, ok := incomplete[i]; ok {
+		nlink, linked := nlinks[i]
+		done := s.done(it, counts)
+		switch {
+		case done:
+			p.Skipped[SkipAlreadyDone] += len(it.Names)
+			continue
+		case linked && uint64(len(it.Names)) != nlink:
+			// A hardlinked file with names outside the folder (or being changed right now) is left
+			// alone, even with --process-hardlinks: rewriting only some of its names would split it
+			// into two separate copies. Each name found is logged, so the user can find the file and
+			// point the run at a folder holding all of them.
 			p.Skipped[SkipHardlinksOutside] += len(it.Names)
 			why := outsideReason(len(it.Names), nlink)
 			for _, name := range it.Names {
 				s.r.log.WithFields(logrus.Fields{"op": "skipped", "path": name, "reason": why}).Info("Skipped")
 			}
 			continue
-		}
-		done := 0
-		for _, name := range it.Names {
-			done = max(done, counts[name])
-		}
-		if done >= s.r.cfg.Passes {
-			p.Skipped[SkipAlreadyDone] += len(it.Names)
+		case linked && !s.r.cfg.ProcessHardlinks:
+			// Named in the summary, which says how to include them.
+			p.Skipped[SkipHardlinked] += len(it.Names)
+			p.Hardlinked = append(p.Hardlinked, it.Names...)
 			continue
 		}
 		p.Items = append(p.Items, it)
@@ -206,6 +208,17 @@ func (s *scanner) finish(counts map[string]int) {
 			delete(p.dirs, dir)
 		}
 	}
+}
+
+// done reports whether it has already been rewritten Config.Passes times. A rewrite counts every
+// name of a hardlinked file, so any one of its names will do: a name added since then has no count
+// of its own yet, but the file it names was rewritten all the same.
+func (s *scanner) done(it Item, counts map[string]int) bool {
+	n := 0
+	for _, name := range it.Names {
+		n = max(n, counts[name])
+	}
+	return n >= s.r.cfg.Passes
 }
 
 // outsideReason explains why a hardlinked file found under found of its nlink names is left alone.
