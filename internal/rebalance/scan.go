@@ -22,8 +22,8 @@ const legacySuffix = ".balance"
 // It skips ".zfs" snapshot folders, the paths in Config.Exclude and Config.ExcludeIDs, symlinks and
 // anything else that isn't a regular file. Temporary files left by an earlier run go into
 // Plan.StaleTemps. Files that are already done (Config.Passes), hardlinked files that can't be
-// handled and, without root, files owned by someone else are counted in Plan.Skipped. If ctx is
-// cancelled the walk stops and ctx.Err() is returned.
+// handled and, without root, files owned by someone else or in a group the user isn't in are
+// counted in Plan.Skipped. If ctx is cancelled the walk stops and ctx.Err() is returned.
 func (r *Rebalancer) Scan(ctx context.Context) (*Plan, error) {
 	counts, err := r.state.Counts()
 	if err != nil {
@@ -91,7 +91,7 @@ func (s *scanner) visit(rel string, d fs.DirEntry, err error) error {
 			return fs.SkipDir
 		}
 		s.folders[rel] = info
-		s.plan.dirs[rel] = dirTimes{id: info.ID, atime: info.Atime, mtime: info.Mtime, ctime: info.Ctime}
+		s.plan.dirs[rel] = dirTimes{atime: info.Atime, mtime: info.Mtime, stamp: stampOf(info)}
 		return nil
 	}
 	if !d.Type().IsRegular() {
@@ -126,9 +126,9 @@ func (s *scanner) visit(rel string, d fs.DirEntry, err error) error {
 
 	// Checked here, before anything is read, so a run without root never copies a file it
 	// can't give back to its owner.
-	if why := s.r.as.cantRewrite(info, s.folders[path.Dir(rel)]); why != "" {
-		s.plan.Skipped[SkipOwner]++
-		s.r.log.WithFields(logrus.Fields{"op": "skipped", "path": rel, "reason": why}).Debug("Skipped")
+	if why, text := s.r.as.cantRewrite(info, s.folders[path.Dir(rel)]); why != "" {
+		s.plan.Skipped[why]++
+		s.r.log.WithFields(logrus.Fields{"op": "skipped", "path": rel, "reason": text}).Debug("Skipped")
 		return nil
 	}
 

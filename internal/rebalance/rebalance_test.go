@@ -125,6 +125,15 @@ func TestSkipReasonPhrase(t *testing.T) {
 		{SkipOrphanBalance, 2, "2 leftover .balance files"},
 		{SkipOwner, 1, "1 file owned by someone else"},
 		{SkipOwner, 3, "3 files owned by someone else"},
+		{SkipGroup, 1, "1 file in a group you're not in"},
+		{SkipGroup, 2, "2 files in groups you're not in"},
+		{SkipOwnerNotKept, 1, "1 file whose owner or group couldn't be kept"},
+		{SkipOwnerNotKept, 2, "2 files whose owners or groups couldn't be kept"},
+		{SkipProjectID, 1, "1 file whose project ID differs from its folder's"},
+		{SkipProjectID, 2, "2 files whose project IDs differ from their folders'"},
+		{SkipUndeletable, 1, "1 file protected from deletion"},
+		{SkipBusy, 1, "1 file in use by another program or run"},
+		{SkipBusy, 3, "3 files in use by other programs or runs"},
 		{SkipHardlinksOutside, 1, "1 file with hardlinks outside the folder"},
 		{SkipAlreadyDone, 1234, "1,234 already done"},
 		{SkipHardlinked, 1, "1 hardlinked"},
@@ -141,8 +150,8 @@ func TestSkipReasonPhrase(t *testing.T) {
 		}
 	}
 	every := []SkipReason{SkipAlreadyDone, SkipHardlinked, SkipHardlinksOutside, SkipOrphanBalance, SkipUnreadable,
-		SkipMissing, SkipOwner, SkipChanged, SkipLinksChanged, SkipNotRegular, SkipMetadata, SkipNoPermission,
-		SkipImmutable, SkipQuota}
+		SkipMissing, SkipOwner, SkipGroup, SkipOwnerNotKept, SkipChanged, SkipLinksChanged, SkipNotRegular,
+		SkipMetadata, SkipProjectID, SkipNoPermission, SkipImmutable, SkipUndeletable, SkipQuota, SkipBusy}
 	for _, why := range every {
 		if _, ok := skipPhrases[why]; !ok {
 			t.Errorf("%q has no phrases", why)
@@ -217,5 +226,47 @@ func TestProgress(t *testing.T) {
 	}
 	if s.Bytes != p.TotalBytes || s.Duration <= 0 {
 		t.Errorf("summary = %+v", s)
+	}
+}
+
+func TestNothingNew(t *testing.T) {
+	resumed := func(change func(*Summary)) Summary {
+		s := Summary{
+			Total:      4,
+			Skipped:    map[SkipReason]int{SkipAlreadyDone: 100, SkipImmutable: 3, SkipProjectID: 1},
+			RunSkipped: map[SkipReason]int{SkipImmutable: 3, SkipProjectID: 1},
+		}
+		change(&s)
+		return s
+	}
+	tests := []struct {
+		name string
+		s    Summary
+		want string
+	}{
+		{"only lasting skips left", resumed(func(*Summary) {}),
+			"Nothing new to rebalance: the 4 remaining files were skipped again " +
+				"(3 files marked immutable or append-only, 1 file whose project ID differs from its folder's)."},
+		{"one file left", resumed(func(s *Summary) {
+			s.Total = 1
+			s.Skipped = map[SkipReason]int{SkipAlreadyDone: 9, SkipUndeletable: 1}
+			s.RunSkipped = map[SkipReason]int{SkipUndeletable: 1}
+		}), "Nothing new to rebalance: the remaining file was skipped again (1 file protected from deletion)."},
+		{"a first run", resumed(func(s *Summary) { delete(s.Skipped, SkipAlreadyDone) }), ""},
+		{"nothing to do", resumed(func(s *Summary) { s.Total, s.RunSkipped = 0, nil }), ""},
+		{"something rebalanced", resumed(func(s *Summary) { s.Total, s.Rebalanced = 5, 1 }), ""},
+		{"something failed", resumed(func(s *Summary) { s.Total, s.Failed = 5, 1 }), ""},
+		{"stopped early", resumed(func(s *Summary) { s.Total, s.Remaining, s.Stopped = 6, 2, Interrupted }), ""},
+		{"a skip that may not happen again", resumed(func(s *Summary) {
+			s.Total = 5
+			s.RunSkipped[SkipBusy] = 1
+		}), ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.s.NothingNew(); got != tt.want {
+				t.Errorf("NothingNew() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

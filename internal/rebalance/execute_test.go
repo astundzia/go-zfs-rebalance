@@ -17,6 +17,7 @@ import (
 	"github.com/astundzia/go-zfs-rebalance/v2/internal/database"
 	"github.com/astundzia/go-zfs-rebalance/v2/internal/fileutil"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 )
 
 func TestPassesCapAcrossRuns(t *testing.T) {
@@ -52,7 +53,7 @@ func TestPassesCapAcrossRuns(t *testing.T) {
 func TestResumeWithDatabase(t *testing.T) {
 	// The state file lives inside the folder being rebalanced, reached through an unresolved path
 	// (on macOS the temp folder is behind the /var symlink), so it must be recognised and left alone.
-	unresolved := t.TempDir()
+	unresolved := testDir(t)
 	root, err := filepath.EvalSymlinks(unresolved)
 	if err != nil {
 		t.Fatal(err)
@@ -247,7 +248,8 @@ func TestPermissionErrorsDependOnRoot(t *testing.T) {
 		{"open refused to root", denied, true, "", denied.Error()},
 		{"rename refused to root", notPermitted, true, "", notPermitted.Error()},
 		{"metadata", metadata, false, SkipMetadata, metadata.Error()},
-		{"ownership", ownership, false, SkipOwner, ownership.Error()},
+		{"ownership", ownership, false, SkipOwnerNotKept, ownership.Error()},
+		{"ownership as root", ownership, true, SkipOwnerNotKept, ownership.Error()},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -291,13 +293,16 @@ func TestOutcomeOfEachError(t *testing.T) {
 		stopped   StopReason
 		remaining int
 	}{
-		{err: fileutil.ErrOwnership, skip: SkipOwner, level: logrus.WarnLevel},
+		{err: fileutil.ErrOwnership, skip: SkipOwnerNotKept, level: logrus.WarnLevel},
 		{err: fileutil.ErrModified, skip: SkipChanged, level: logrus.InfoLevel},
 		{err: fileutil.ErrLinkMismatch, skip: SkipLinksChanged, level: logrus.InfoLevel},
 		{err: fileutil.ErrNotRegular, skip: SkipNotRegular, level: logrus.InfoLevel},
 		{err: fileutil.ErrChecksum, failed: 1, level: logrus.ErrorLevel},
 		{err: fileutil.ErrMetadata, skip: SkipMetadata, level: logrus.WarnLevel},
+		{err: fileutil.ErrProjectID, skip: SkipProjectID, level: logrus.InfoLevel},
 		{err: fileutil.ErrImmutable, skip: SkipImmutable, level: logrus.InfoLevel},
+		{err: fileutil.ErrUndeletable, skip: SkipUndeletable, level: logrus.InfoLevel},
+		{err: fileutil.ErrBusy, skip: SkipBusy, level: logrus.InfoLevel},
 		{err: fileutil.ErrNoSpace, failed: 1, level: logrus.ErrorLevel, stopped: NoSpace, remaining: 2},
 	}
 	for _, tt := range tests {
@@ -315,8 +320,8 @@ func TestOutcomeOfEachError(t *testing.T) {
 			if s.Failed != tt.failed || s.Stopped != tt.stopped || s.Remaining != tt.remaining || s.Rebalanced != wantRebalanced {
 				t.Errorf("summary = %+v", s)
 			}
-			if tt.skip != "" && s.Skipped[tt.skip] != 1 {
-				t.Errorf("skipped = %v, want 1 %q", s.Skipped, tt.skip)
+			if tt.skip != "" && (s.Skipped[tt.skip] != 1 || len(s.Skipped) != 1 || s.RunSkipped[tt.skip] != 1) {
+				t.Errorf("skipped = %v (in the run %v), want only 1 %q", s.Skipped, s.RunSkipped, tt.skip)
 			}
 			lines := append(logs.op("skipped"), logs.op("failed")...)
 			if len(lines) != 1 || lines[0].level != tt.level || lines[0].data["path"] != "a" || lines[0].data["reason"] != err.Error() {
@@ -549,7 +554,12 @@ func TestFolderTimesKeptWhenAnotherProgramChangesTheFolder(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			download := func() { writeFile(t, root, "media/new-episode.mkv", []byte("new")) }
+			// A real download takes longer than a tick of the clock Linux stamps files with, so the
+			// folder's times change too; TestStampSame covers a change within the same tick.
+			download := func() {
+				time.Sleep(20 * time.Millisecond)
+				writeFile(t, root, "media/new-episode.mkv", []byte("new"))
+			}
 			state := &callbackState{memoryState: memoryState{counts: map[string]int{}}, on: map[string]func(){}}
 			r, logs := newRebalancer(t, Config{Root: root, Concurrency: 1, State: state})
 			p := scan(t, r)
@@ -618,4 +628,206 @@ func TestLargeTree(t *testing.T) {
 		checkRewritten(t, before, after, rel)
 	}
 	checkNoTemps(t, root)
+}
+
+// A folder's stamp must change with any entry added or removed, even one that leaves its times as
+// they were because it came within the same tick of the clock as the run's own change.
+func TestStampSame(t *testing.T) {
+	t0 := time.Date(2026, 10, 3, 12, 0, 0, 4_000_000, time.UTC)
+	base := stamp{id: fileutil.FileID{Dev: 1, Ino: 2}, mtime: t0, ctime: t0, size: 5, nlink: 2}
+	tests := []struct {
+		name   string
+		change func(*stamp)
+		same   bool
+	}{
+		{"unchanged", func(*stamp) {}, true},
+		{"replaced", func(s *stamp) { s.id.Ino++ }, false},
+		{"modified later", func(s *stamp) { s.mtime = s.mtime.Add(time.Millisecond) }, false},
+		{"attributes changed later", func(s *stamp) { s.ctime = s.ctime.Add(time.Nanosecond) }, false},
+		{"file added in the same tick", func(s *stamp) { s.size++ }, false},
+		{"file removed in the same tick", func(s *stamp) { s.size-- }, false},
+		{"subfolder added in the same tick", func(s *stamp) { s.nlink++ }, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			other := base
+			tt.change(&other)
+			if got := base.same(other); got != tt.same {
+				t.Errorf("same = %v, want %v", got, tt.same)
+			}
+		})
+	}
+}
+
+// After a run stops because the dataset is full or at its quota, ZFS frees the abandoned copies'
+// space a little later, and until then even setting a folder's times fails. The run waits a
+// little for that before giving up, but never for long in all.
+func TestFolderTimesWaitForSpace(t *testing.T) {
+	old := time.Date(2000, 1, 2, 3, 4, 5, 0, time.UTC)
+	tests := []struct {
+		name     string
+		err      error
+		failures int // how many attempts fail before the space is freed; -1 if it never is
+		calls    map[string]int
+		warned   int
+	}{
+		{"quota frees up", syscall.EDQUOT, 2, map[string]int{"a": 3, "b": 1}, 0},
+		{"pool frees up", syscall.ENOSPC, 1, map[string]int{"a": 2, "b": 1}, 0},
+		{"never frees up", syscall.EDQUOT, -1, map[string]int{"a": 4, "b": 2}, 2},
+		{"refused", syscall.EPERM, -1, map[string]int{"a": 1, "b": 1}, 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := tempRoot(t)
+			for _, rel := range []string{"a/f", "b/g"} {
+				writeFile(t, root, rel, []byte(rel))
+			}
+			for _, dir := range []string{"a", "b"} {
+				if err := os.Chtimes(filepath.Join(root, dir), old, old); err != nil {
+					t.Fatal(err)
+				}
+			}
+			delays, budget := noSpaceDelays, noSpaceBudget
+			t.Cleanup(func() { noSpaceDelays, noSpaceBudget, setFolderTimes = delays, budget, fileutil.SetTimes })
+			noSpaceDelays = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
+			noSpaceBudget = 4 * time.Millisecond
+			calls := map[string]int{}
+			failed := 0
+			setFolderTimes = func(d *os.File, atime, mtime time.Time) error {
+				dir := filepath.Base(d.Name())
+				calls[dir]++
+				if tt.failures < 0 || failed < tt.failures {
+					failed++
+					return &os.PathError{Op: "utimensat", Path: dir, Err: tt.err}
+				}
+				return fileutil.SetTimes(d, atime, mtime)
+			}
+			r, logs := newRebalancer(t, Config{Root: root, Concurrency: 1})
+
+			_, s := scanAndExecute(t, r)
+			if s.Rebalanced != 2 || s.FolderTimesNotRestored != tt.warned {
+				t.Errorf("summary = %+v", s)
+			}
+			if fmt.Sprint(calls) != fmt.Sprint(tt.calls) {
+				t.Errorf("attempts per folder = %v, want %v", calls, tt.calls)
+			}
+			if w := logs.op("warning"); len(w) != tt.warned {
+				t.Errorf("warnings = %+v", w)
+			}
+			for _, dir := range []string{"a", "b"} {
+				if restored := lstatInfo(t, filepath.Join(root, dir)).Mtime.Equal(old); restored != (tt.warned == 0) {
+					t.Errorf("%s: modified time put back = %v", dir, restored)
+				}
+			}
+		})
+	}
+}
+
+// A folder's times are only ever set on the folder the run worked in, through the folder it opened
+// and checked; never on another folder that a symlink in its place leads to.
+func TestFolderTimesNeverSetThroughASymlink(t *testing.T) {
+	root := tempRoot(t)
+	writeFile(t, root, "media/a.mkv", []byte("a"))
+	if err := os.Mkdir(filepath.Join(root, "elsewhere"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Date(2000, 1, 2, 3, 4, 5, 0, time.UTC)
+	for _, dir := range []string{"media", "elsewhere"} {
+		if err := os.Chtimes(filepath.Join(root, dir), old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	state := &callbackState{memoryState: memoryState{counts: map[string]int{}}, on: map[string]func(){}}
+	state.on["media/a.mkv"] = func() {
+		if err := os.Rename(filepath.Join(root, "media"), filepath.Join(root, "media-moved")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("elsewhere", filepath.Join(root, "media")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(filepath.Join(root, "elsewhere"), old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r, logs := newRebalancer(t, Config{Root: root, Concurrency: 1, State: state})
+
+	_, s := scanAndExecute(t, r)
+	if s.Rebalanced != 1 || s.FolderTimesNotRestored != 0 {
+		t.Errorf("summary = %+v", s)
+	}
+	got := lstatInfo(t, filepath.Join(root, "elsewhere"))
+	if !got.Mtime.Equal(old) || !got.Atime.Equal(old) {
+		t.Errorf("the folder behind the symlink got times %v, %v", got.Atime, got.Mtime)
+	}
+	if w := logs.op("warning"); len(w) != 0 {
+		t.Errorf("warnings = %+v", w)
+	}
+}
+
+// A file that another program or run has locked is left alone, and the rest of the run goes on.
+func TestLockedFileIsSkippedAsBusy(t *testing.T) {
+	root := tempRoot(t)
+	for _, n := range []string{"busy", "free"} {
+		writeFile(t, root, n, randomBytes(64<<10))
+	}
+	f, err := os.Open(filepath.Join(root, "busy"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshot(t, root)
+	r, logs := newRebalancer(t, Config{Root: root})
+
+	_, s := scanAndExecute(t, r)
+	if s.Rebalanced != 1 || s.Skipped[SkipBusy] != 1 || s.Failed != 0 {
+		t.Errorf("summary = %+v", s)
+	}
+	after := snapshot(t, root)
+	checkUntouched(t, before, after, "busy")
+	checkRewritten(t, before, after, "free")
+	sk := logs.op("skipped")
+	if len(sk) != 1 || sk[0].level != logrus.InfoLevel || sk[0].data["reason"] != fileutil.ErrBusy.Error() {
+		t.Errorf("skipped log lines = %+v", sk)
+	}
+}
+
+// A resumed run that finds only files skipped again for reasons that last says so plainly, and
+// still tries them, in case the reason has been dealt with.
+func TestResumeWithOnlyLastingSkipsSaysNothingNew(t *testing.T) {
+	root := tempRoot(t)
+	for _, n := range []string{"a", "b", "locked", "projdir/own-id"} {
+		writeFile(t, root, n, []byte(n))
+	}
+	tried := map[string]int{}
+	t.Cleanup(func() { replace = fileutil.ReplaceGroup })
+	replace = func(ctx context.Context, root *os.Root, rels []string, opts fileutil.Options) (fileutil.Result, error) {
+		tried[rels[0]]++
+		switch rels[0] {
+		case "locked":
+			return fileutil.Result{}, fmt.Errorf("%w (detail)", fileutil.ErrImmutable)
+		case "projdir/own-id":
+			return fileutil.Result{}, fmt.Errorf("%w (detail)", fileutil.ErrProjectID)
+		}
+		return fileutil.ReplaceGroup(ctx, root, rels, opts)
+	}
+	state := &memoryState{counts: map[string]int{}}
+	r, _ := newRebalancer(t, Config{Root: root, Concurrency: 1, State: state})
+
+	_, first := scanAndExecute(t, r)
+	if first.Rebalanced != 2 || first.NothingNew() != "" {
+		t.Errorf("first run: %+v, %q", first, first.NothingNew())
+	}
+	r2, _ := newRebalancer(t, Config{Root: root, Concurrency: 1, State: state})
+	_, again := scanAndExecute(t, r2)
+	want := "Nothing new to rebalance: the 2 remaining files were skipped again " +
+		"(1 file marked immutable or append-only, 1 file whose project ID differs from its folder's)."
+	if again.Total != 2 || again.Rebalanced != 0 || again.NothingNew() != want {
+		t.Errorf("second run: %+v, %q", again, again.NothingNew())
+	}
+	if tried["locked"] != 2 || tried["projdir/own-id"] != 2 {
+		t.Errorf("tries = %v, want both skipped files tried on each run", tried)
+	}
 }

@@ -38,18 +38,19 @@ func currentAccount() account {
 }
 
 // cantRewrite returns why a file whose status is file, in the folder whose status is dir, can't be
-// rewritten without root, or "" if it can be. A new file takes its folder's group on macOS, and on
-// Linux when the folder has the setgid bit, so a file with that group needs no change of group.
-func (a account) cantRewrite(file, dir fileutil.Info) string {
+// rewritten without root (SkipOwner or SkipGroup, with a short explanation), or "" if it can be. A
+// new file takes its folder's group on macOS, and on Linux when the folder has the setgid bit, so a
+// file with that group needs no change of group.
+func (a account) cantRewrite(file, dir fileutil.Info) (SkipReason, string) {
 	switch {
 	case a.root:
-		return ""
+		return "", ""
 	case file.UID != a.uid:
-		return reasonOtherOwner
+		return SkipOwner, reasonOtherOwner
 	case a.groups[file.GID]:
-		return ""
+		return "", ""
 	case dir.Mode.IsDir() && file.GID == dir.GID && (runtime.GOOS == "darwin" || dir.Mode&os.ModeSetgid != 0):
-		return ""
+		return "", ""
 	}
-	return reasonOtherGroup
+	return SkipGroup, reasonOtherGroup
 }

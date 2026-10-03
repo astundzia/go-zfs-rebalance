@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
+	"os"
 	"path"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -15,11 +18,23 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// Test seams. replace rewrites one item, and freeBytes says how much room is left in a folder;
-// tests swap them to simulate failures, such as a full pool, that are hard to cause for real.
+// Test seams. replace rewrites one item, freeBytes says how much room is left in a folder and
+// setFolderTimes puts back a folder's times; tests swap them to simulate failures, such as a full
+// pool, that are hard to cause for real.
 var (
-	replace   = fileutil.ReplaceGroup
-	freeBytes = folderFreeBytes
+	replace        = fileutil.ReplaceGroup
+	freeBytes      = folderFreeBytes
+	setFolderTimes = fileutil.SetTimes
+)
+
+// When putting back a folder's times fails because the filesystem is out of space or over quota,
+// it is tried again after each of noSpaceDelays: after a run stops for lack of space, ZFS frees the
+// abandoned copies' space a few seconds later. All the folders of a run share noSpaceBudget of
+// waiting, so a dataset that stays full can't hold up the end of the run for long.
+var (
+	noSpaceDelays = []time.Duration{100 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond,
+		800 * time.Millisecond, 1500 * time.Millisecond, 2 * time.Second}
+	noSpaceBudget = 5 * time.Second
 )
 
 // quotaMargin is how much free space, beyond twice the file's size on disk, the filesystem must
@@ -41,7 +56,8 @@ const (
 // copied are abandoned and left as they were), the pool runs out of space, or a file goes missing
 // and Config.HaltOnMissing is set; Summary.Stopped says which. Folder timestamps changed by the run
 // are put back as each folder is finished, and at the end for any left over, unless another
-// program changed the folder in the meantime.
+// program changed the folder in the meantime; a filesystem that is out of space is given a few
+// seconds to free some first.
 //
 // Problems with single files are reported in the Summary and the log, not as an error. Scan again
 // before each Execute: running the same Plan twice rewrites its files twice.
@@ -120,6 +136,8 @@ type execution struct {
 	folders          map[string]*folder
 	skipped          map[SkipReason]int
 	timesNotRestored int
+
+	spaceWaited atomic.Int64 // time spent waiting for space to put back folder times, in nanoseconds
 }
 
 // folder is what the run knows about a folder it works in. Its times are put back once the run is
@@ -135,14 +153,23 @@ type folder struct {
 	foreign bool  // another program changed it while the run was using it
 }
 
-// stamp is what changes whenever a folder's entries do.
+// stamp is what changes whenever a folder's entries do. Linux takes timestamps from a clock that
+// only moves every few milliseconds, so an entry added or removed within the same tick as the
+// run's own change leaves the times as they were; the size (on ZFS and tmpfs the number of entries,
+// on macOS a multiple of it) and the link count (which counts subfolders) still give it away.
 type stamp struct {
 	id           fileutil.FileID
 	mtime, ctime time.Time
+	size         int64
+	nlink        uint64
+}
+
+func stampOf(info fileutil.Info) stamp {
+	return stamp{id: info.ID, mtime: info.Mtime, ctime: info.Ctime, size: info.Size, nlink: info.Nlink}
 }
 
 func (s stamp) same(o stamp) bool {
-	return s.id == o.id && s.mtime.Equal(o.mtime) && s.ctime.Equal(o.ctime)
+	return s.id == o.id && s.mtime.Equal(o.mtime) && s.ctime.Equal(o.ctime) && s.size == o.size && s.nlink == o.nlink
 }
 
 // folder returns the state of dir, creating it if needed. x.mu must be held, or Execute must not
@@ -160,8 +187,8 @@ func (x *execution) folder(dir string) *folder {
 func (x *execution) process(ctx context.Context, it Item) {
 	defer x.finish(it)
 	// Scan checked the owner, but it may have changed since.
-	if why := x.ownerChanged(it); why != "" {
-		x.skip(it, SkipOwner, why, logrus.InfoLevel)
+	if why, text := x.ownerChanged(it); why != "" {
+		x.skip(it, why, text, logrus.InfoLevel)
 		return
 	}
 	dirs := itemDirs(it)
@@ -173,18 +200,18 @@ func (x *execution) process(ctx context.Context, it Item) {
 
 // ownerChanged returns why the item can no longer be rewritten without root, or "" if it can (or
 // if it can't be checked, which replace then reports).
-func (x *execution) ownerChanged(it Item) string {
+func (x *execution) ownerChanged(it Item) (SkipReason, string) {
 	r := x.r
 	if r.as.root {
-		return ""
+		return "", ""
 	}
 	file, err := fileutil.Lstat(r.root, it.Names[0])
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	dir, err := fileutil.Lstat(r.root, path.Dir(it.Names[0]))
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	return r.as.cantRewrite(file, dir)
 }
@@ -196,6 +223,13 @@ func (x *execution) outcome(it Item, res fileutil.Result, err error) {
 	switch {
 	case err == nil:
 		x.succeeded(it, res)
+	case fileutil.LeftSplit(err):
+		// Some names already use the new copy: nothing was lost, but the group is now split, so
+		// this needs a person's attention whatever stopped it.
+		x.failed(it, "Couldn't finish switching this file's hardlinked names", err)
+		if errors.Is(err, fileutil.ErrNoSpace) {
+			r.stopWith(NoSpace)
+		}
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		// Abandoned part-way: the file is as it was, and a resumed run will pick it up.
 		r.log.WithField("path", it.Names[0]).Debug("Stopped before this file was finished; it was left as it was")
@@ -207,10 +241,17 @@ func (x *execution) outcome(it Item, res fileutil.Result, err error) {
 		}
 		x.failed(it, "Ran out of free space, so the run is stopping", err)
 		r.stopWith(NoSpace)
+	case errors.Is(err, fileutil.ErrBusy):
+		x.skip(it, SkipBusy, err.Error(), logrus.InfoLevel)
+	case errors.Is(err, fileutil.ErrUndeletable):
+		x.skip(it, SkipUndeletable, err.Error(), logrus.InfoLevel)
 	case errors.Is(err, fileutil.ErrImmutable):
 		x.skip(it, SkipImmutable, err.Error(), logrus.InfoLevel)
 	case errors.Is(err, fileutil.ErrOwnership):
-		x.skip(it, SkipOwner, err.Error(), logrus.WarnLevel)
+		x.skip(it, SkipOwnerNotKept, err.Error(), logrus.WarnLevel)
+	case errors.Is(err, fileutil.ErrProjectID):
+		// Linux and ZFS won't move a copy into a folder that gives new files another project ID.
+		x.skip(it, SkipProjectID, err.Error(), logrus.InfoLevel)
 	case errors.Is(err, fileutil.ErrModified):
 		x.skip(it, SkipChanged, err.Error(), logrus.InfoLevel)
 	case errors.Is(err, fileutil.ErrLinkMismatch):
@@ -352,7 +393,7 @@ func (x *execution) begin(dirs ...string) {
 			if !known {
 				var t dirTimes
 				t, known = x.plan.dirs[dir]
-				want = t.stamp()
+				want = t.stamp
 			}
 			if known {
 				if now, err := x.stamp(dir); err != nil || !now.same(want) {
@@ -386,7 +427,7 @@ func (x *execution) stamp(dir string) (stamp, error) {
 	if err != nil {
 		return stamp{}, err
 	}
-	return stamp{id: info.ID, mtime: info.Mtime, ctime: info.Ctime}, nil
+	return stampOf(info), nil
 }
 
 // finish puts back the times of every folder in which it was the last item.
@@ -444,25 +485,35 @@ func (x *execution) restore(dirs []string) {
 
 // restoreDir gives a folder back the access and modified times Scan saw, so tools that look at
 // folder times don't think every folder changed. A folder that was replaced, or that another
-// program changed while the run was using it, keeps its new times.
+// program changed while the run was using it, keeps its new times. The folder is checked and its
+// times set through one open descriptor, so they can't land on anything put in its place.
 func (x *execution) restoreDir(dir string, f folder) {
 	log := x.r.log
 	want, ok := x.plan.dirs[dir]
 	if !ok {
 		return
 	}
-	now, err := fileutil.Lstat(x.r.root, dir)
-	if err != nil || !now.Mode.IsDir() || now.ID != want.id {
+	d, err := openDir(x.r.root, dir)
+	if err != nil {
+		return // gone, or replaced by something that isn't a folder
+	}
+	defer d.Close()
+	fi, err := d.Stat()
+	if err != nil {
 		return
 	}
-	if f.foreign || !f.last.same(stamp{id: now.ID, mtime: now.Mtime, ctime: now.Ctime}) {
+	now, err := fileutil.InfoOf(fi)
+	if err != nil || !now.Mode.IsDir() || now.ID != want.stamp.id {
+		return
+	}
+	if f.foreign || !f.last.same(stampOf(now)) {
 		log.WithField("path", dir).Debug("Left this folder's times as they are, because another program changed the folder during the run")
 		return
 	}
 	if now.Atime.Equal(want.atime) && now.Mtime.Equal(want.mtime) {
 		return
 	}
-	err = x.r.root.Chtimes(dir, want.atime, want.mtime)
+	err = x.setDirTimes(d, want.atime, want.mtime)
 	switch {
 	case err == nil:
 	case now.Mtime.Equal(want.mtime):
@@ -475,6 +526,22 @@ func (x *execution) restoreDir(dir string, f folder) {
 		log.WithFields(logrus.Fields{"op": "warning", "path": dir, "reason": reasonOf(err)}).
 			Warn("Couldn't put back this folder's modified time, so it shows when the run changed it")
 	}
+}
+
+// setDirTimes sets the times of the open folder d, trying again for a while if the filesystem is
+// out of space or over quota (see noSpaceDelays).
+func (x *execution) setDirTimes(d *os.File, atime, mtime time.Time) error {
+	for _, delay := range noSpaceDelays {
+		err := setFolderTimes(d, atime, mtime)
+		if !errors.Is(err, syscall.EDQUOT) && !errors.Is(err, syscall.ENOSPC) {
+			return err
+		}
+		if x.spaceWaited.Add(int64(delay)) > int64(noSpaceBudget) {
+			return err
+		}
+		time.Sleep(delay)
+	}
+	return setFolderTimes(d, atime, mtime)
 }
 
 func (x *execution) summary(ctx context.Context, start time.Time) Summary {
@@ -493,6 +560,7 @@ func (x *execution) summary(ctx context.Context, start time.Time) Summary {
 	}
 	runSkipped := 0
 	x.mu.Lock()
+	s.RunSkipped = maps.Clone(x.skipped)
 	for why, n := range x.skipped {
 		s.Skipped[why] += n
 		runSkipped += n

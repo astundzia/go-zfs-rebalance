@@ -98,20 +98,26 @@ func newTestLogger() (*logrus.Logger, *logCapture) {
 // example one on a ZFS dataset, as fileutil's tests do.
 const testDirEnv = "REBALANCE_TEST_DIR"
 
+// testDir returns a new empty folder in the folder named by testDirEnv, or else in the system's
+// temporary folder, removed when the test ends.
+func testDir(t *testing.T) string {
+	t.Helper()
+	base := os.Getenv(testDirEnv)
+	if base == "" {
+		return t.TempDir()
+	}
+	dir, err := os.MkdirTemp(base, "rebalance-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
 // tempRoot returns a new empty folder with symlinks resolved, as the command passes it.
 func tempRoot(t *testing.T) string {
 	t.Helper()
-	var dir string
-	if base := os.Getenv(testDirEnv); base != "" {
-		var err error
-		if dir, err = os.MkdirTemp(base, "rebalance-test-"); err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	} else {
-		dir = t.TempDir()
-	}
-	dir, err := filepath.EvalSymlinks(dir)
+	dir, err := filepath.EvalSymlinks(testDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}

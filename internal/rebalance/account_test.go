@@ -25,32 +25,33 @@ func TestCantRewrite(t *testing.T) {
 	plainDir := fileutil.Info{Mode: os.ModeDir | 0o755, GID: 50}
 	setgidDir := fileutil.Info{Mode: os.ModeDir | os.ModeSetgid | 0o2775, GID: 50}
 	// macOS gives every new file its folder's group; Linux only does so for setgid folders.
-	passesGroup := ""
+	var passesGroup SkipReason
 	if runtime.GOOS != "darwin" {
-		passesGroup = reasonOtherGroup
+		passesGroup = SkipGroup
 	}
+	texts := map[SkipReason]string{"": "", SkipOwner: reasonOtherOwner, SkipGroup: reasonOtherGroup}
 
 	tests := []struct {
 		name string
 		as   account
 		file fileutil.Info
 		dir  fileutil.Info
-		want string
+		want SkipReason
 	}{
 		{"root rewrites anything", account{root: true}, fileutil.Info{UID: 7, GID: 7}, plainDir, ""},
 		{"my file, my group", me, fileutil.Info{UID: 1000, GID: 1000}, plainDir, ""},
 		{"my file, another of my groups", me, fileutil.Info{UID: 1000, GID: 27}, plainDir, ""},
-		{"someone else's file", me, fileutil.Info{UID: 1001, GID: 1000}, plainDir, reasonOtherOwner},
-		{"someone else's file in a setgid folder", me, fileutil.Info{UID: 1001, GID: 50}, setgidDir, reasonOtherOwner},
-		{"my file, a group I'm not in", me, fileutil.Info{UID: 1000, GID: 60}, plainDir, reasonOtherGroup},
+		{"someone else's file", me, fileutil.Info{UID: 1001, GID: 1000}, plainDir, SkipOwner},
+		{"someone else's file in a setgid folder", me, fileutil.Info{UID: 1001, GID: 50}, setgidDir, SkipOwner},
+		{"my file, a group I'm not in", me, fileutil.Info{UID: 1000, GID: 60}, plainDir, SkipGroup},
 		{"my file, its setgid folder's group", me, fileutil.Info{UID: 1000, GID: 50}, setgidDir, ""},
 		{"my file, its plain folder's group", me, fileutil.Info{UID: 1000, GID: 50}, plainDir, passesGroup},
-		{"folder unknown", me, fileutil.Info{UID: 1000, GID: 50}, fileutil.Info{}, reasonOtherGroup},
+		{"folder unknown", me, fileutil.Info{UID: 1000, GID: 50}, fileutil.Info{}, SkipGroup},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.as.cantRewrite(tt.file, tt.dir); got != tt.want {
-				t.Errorf("cantRewrite = %q, want %q", got, tt.want)
+			if why, text := tt.as.cantRewrite(tt.file, tt.dir); why != tt.want || text != texts[tt.want] {
+				t.Errorf("cantRewrite = %q, %q; want %q, %q", why, text, tt.want, texts[tt.want])
 			}
 		})
 	}
@@ -156,8 +157,11 @@ func TestGroupNotYoursSkippedUnlessTheFolderGivesIt(t *testing.T) {
 		r.as = account{uid: mine.UID, groups: map[uint32]bool{mine.GID: true}}
 
 		p, s := scanAndExecute(t, r)
-		if p.Skipped[SkipOwner] != 1 || s.Rebalanced != 1 {
+		if p.Skipped[SkipGroup] != 1 || len(p.Skipped) != 1 || s.Rebalanced != 1 {
 			t.Errorf("plan skipped %v, summary %+v", p.Skipped, s)
+		}
+		if got := SkipGroup.Phrase(1); got != "1 file in a group you're not in" {
+			t.Errorf("summary label %q", got)
 		}
 		after := snapshot(t, root)
 		checkUntouched(t, before, after, "other-group")
@@ -171,8 +175,12 @@ func TestGroupNotYoursSkippedUnlessTheFolderGivesIt(t *testing.T) {
 			t.Fatal(err)
 		}
 		if runtime.GOOS != "darwin" {
-			if err := os.Chmod(sub, 0o2755); err != nil { // Linux gives new files the group of setgid folders
+			// Linux gives new files the group of setgid folders. (os.Chmod ignores a raw 0o2000.)
+			if err := os.Chmod(sub, 0o755|os.ModeSetgid); err != nil {
 				t.Fatal(err)
+			}
+			if lstatInfo(t, sub).Mode&os.ModeSetgid == 0 {
+				t.Fatal("the folder didn't get the setgid bit")
 			}
 		}
 		writeFile(t, root, "shared/f", []byte("x"))

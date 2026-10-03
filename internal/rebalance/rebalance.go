@@ -7,6 +7,7 @@
 package rebalance
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"io"
@@ -14,7 +15,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -59,14 +62,19 @@ const (
 	SkipOrphanBalance    SkipReason = "leftover .balance file"
 	SkipUnreadable       SkipReason = "couldn't be read"
 	SkipMissing          SkipReason = "missing"
-	SkipOwner            SkipReason = "owner can't be kept" // owned by someone else, or its owner can't be kept
+	SkipOwner            SkipReason = "owned by someone else" // without root
+	SkipGroup            SkipReason = "group you're not in"   // without root: your own file, in a group you're not in
+	SkipOwnerNotKept     SkipReason = "owner can't be kept"   // the copy couldn't be given the file's owner or group
 	SkipChanged          SkipReason = "changed while copying"
 	SkipLinksChanged     SkipReason = "hardlinks changed"
 	SkipNotRegular       SkipReason = "not a regular file"
-	SkipMetadata         SkipReason = "permissions can't be kept exactly"
-	SkipNoPermission     SkipReason = "no permission"    // without root: the file or its folder can't be changed
-	SkipImmutable        SkipReason = "immutable"        // marked immutable, append-only or undeletable
-	SkipQuota            SkipReason = "owner over quota" // its owner or group is over their quota
+	SkipMetadata         SkipReason = "permissions can't be kept exactly" // or ACLs, attributes or timestamps
+	SkipProjectID        SkipReason = "project ID differs"                // from the one its folder gives new files
+	SkipNoPermission     SkipReason = "no permission"                     // without root: the file or its folder can't be changed
+	SkipImmutable        SkipReason = "immutable"                         // marked immutable or append-only
+	SkipUndeletable      SkipReason = "protected from deletion"           // ZFS nounlink, or SF_NOUNLINK on macOS
+	SkipQuota            SkipReason = "owner over quota"                  // its owner or group is over their quota
+	SkipBusy             SkipReason = "in use"                            // another program or run has it locked
 )
 
 // skipPhrases are the singular and plural forms Phrase uses.
@@ -78,13 +86,18 @@ var skipPhrases = map[SkipReason][2]string{
 	SkipUnreadable:       {"couldn't be read", "couldn't be read"},
 	SkipMissing:          {"missing", "missing"},
 	SkipOwner:            {"file owned by someone else", "files owned by someone else"},
+	SkipGroup:            {"file in a group you're not in", "files in groups you're not in"},
+	SkipOwnerNotKept:     {"file whose owner or group couldn't be kept", "files whose owners or groups couldn't be kept"},
 	SkipChanged:          {"changed while copying", "changed while copying"},
 	SkipLinksChanged:     {"file whose hardlinks changed", "files whose hardlinks changed"},
 	SkipNotRegular:       {"not a regular file", "not regular files"},
 	SkipMetadata:         {"file whose permissions can't be kept exactly", "files whose permissions can't be kept exactly"},
+	SkipProjectID:        {"file whose project ID differs from its folder's", "files whose project IDs differ from their folders'"},
 	SkipNoPermission:     {"file you aren't allowed to replace", "files you aren't allowed to replace"},
 	SkipImmutable:        {"file marked immutable or append-only", "files marked immutable or append-only"},
+	SkipUndeletable:      {"file protected from deletion", "files protected from deletion"},
 	SkipQuota:            {"file whose owner or group is over quota", "files whose owners or groups are over quota"},
+	SkipBusy:             {"file in use by another program or run", "files in use by other programs or runs"},
 }
 
 // Phrase describes n files skipped for this reason, for a summary line: "1 leftover .balance file",
@@ -99,6 +112,18 @@ func (s SkipReason) Phrase(n int) string {
 		return "1 " + forms[0]
 	}
 	return thousands(n) + " " + forms[1]
+}
+
+// lasting reports whether a file skipped for this reason will be skipped again by every later run
+// until someone changes the file, its folder or how the run is started. Such files are still tried
+// on every run, in case that has happened.
+func (s SkipReason) lasting() bool {
+	switch s {
+	case SkipOwner, SkipGroup, SkipOwnerNotKept, SkipMetadata, SkipProjectID, SkipNoPermission,
+		SkipImmutable, SkipUndeletable, SkipQuota:
+		return true
+	}
+	return false
 }
 
 // StopReason says why a run ended before every file was handled.
@@ -149,13 +174,11 @@ type Plan struct {
 	dirs map[string]dirTimes // times of the folders the run will touch, to put back afterwards
 }
 
-// dirTimes is a folder's identity and timestamps as seen by Scan.
+// dirTimes is a folder's access and modified times, and its stamp, as seen by Scan.
 type dirTimes struct {
-	id                  fileutil.FileID
-	atime, mtime, ctime time.Time
+	atime, mtime time.Time
+	stamp        stamp
 }
-
-func (d dirTimes) stamp() stamp { return stamp{id: d.id, mtime: d.mtime, ctime: d.ctime} }
 
 // Summary is the outcome of Execute.
 type Summary struct {
@@ -163,6 +186,7 @@ type Summary struct {
 	Rebalanced int                // files rewritten
 	Failed     int                // files that couldn't be rewritten; each was left as it was
 	Skipped    map[SkipReason]int // files left alone, by reason, including those skipped by Scan
+	RunSkipped map[SkipReason]int // the part of Skipped that the run tried and left alone (out of Total)
 	Remaining  int                // files not reached because the run stopped early
 	Bytes      int64              // bytes rewritten
 	Duration   time.Duration
@@ -171,6 +195,46 @@ type Summary struct {
 	// back (each is also logged as a warning). Folders another program changed during the run are
 	// left with their new time on purpose and aren't counted.
 	FolderTimesNotRestored int
+}
+
+// NothingNew explains a finished run that rewrote nothing new: some files were already done, and
+// every other one was skipped again for a reason that lasts until someone deals with it, such as
+// "Nothing new to rebalance: the 4 remaining files were skipped again (3 files marked immutable or
+// append-only, 1 file whose project ID differs from its folder's)." It returns "" for any other run.
+func (s Summary) NothingNew() string {
+	if s.Total == 0 || s.Rebalanced > 0 || s.Failed > 0 || s.Remaining > 0 || s.Stopped != None ||
+		s.Skipped[SkipAlreadyDone] == 0 {
+		return ""
+	}
+	type reason struct {
+		why SkipReason
+		n   int
+	}
+	var reasons []reason
+	total := 0
+	for why, n := range s.RunSkipped {
+		if n == 0 {
+			continue
+		}
+		if !why.lasting() {
+			return ""
+		}
+		reasons = append(reasons, reason{why, n})
+		total += n
+	}
+	if total != s.Total {
+		return ""
+	}
+	slices.SortFunc(reasons, func(a, b reason) int { return cmp.Or(cmp.Compare(b.n, a.n), cmp.Compare(a.why, b.why)) })
+	parts := make([]string, len(reasons))
+	for i, r := range reasons {
+		parts[i] = r.why.Phrase(r.n)
+	}
+	which := "the remaining file was"
+	if total > 1 {
+		which = "the " + thousands(total) + " remaining files were"
+	}
+	return fmt.Sprintf("Nothing new to rebalance: %s skipped again (%s).", which, strings.Join(parts, ", "))
 }
 
 // Progress is a snapshot of a running Execute. Counts are per file name, like Summary.
