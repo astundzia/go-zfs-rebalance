@@ -15,6 +15,7 @@ import (
 	"runtime"
 
 	"github.com/astundzia/go-zfs-rebalance/v2/internal/database"
+	"github.com/astundzia/go-zfs-rebalance/v2/internal/fileutil"
 	"github.com/astundzia/go-zfs-rebalance/v2/internal/rebalance"
 	"github.com/astundzia/go-zfs-rebalance/v2/internal/zfs"
 	"github.com/sirupsen/logrus"
@@ -36,8 +37,12 @@ const (
 // never rewrite it: a new inode would let a second run take the lock while this one holds it.
 const lockFileName = "run.lock"
 
-// goos is runtime.GOOS. Tests change it to check the message on unsupported systems.
-var goos = runtime.GOOS
+// Test seams: runtime.GOOS, to check the message on unsupported systems, and whether the run has
+// root, to check what it says without it.
+var (
+	goos   = runtime.GOOS
+	isRoot = func() bool { return os.Geteuid() == 0 }
+)
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -74,18 +79,42 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if o.report {
 		return report(root, stdout, stderr)
 	}
-	return rebalanceFolder(o, root, stdout, newLogger(stderr, o.debug, o.filenameOnly))
+	return rebalanceFolder(o, root, stdout, newLogger(stderr, o.debug, o.filenameOnly), outputIDs(stdout, stderr))
 }
 
-// rebalanceFolder is a normal run: it rewrites the files in root and returns the exit code.
-func rebalanceFolder(o options, root string, stdout io.Writer, log *logrus.Logger) int {
+// outputIDs returns the identities of the given outputs that are regular files, such as a log
+// redirected into the folder being rebalanced. The run must leave those alone: once rewritten,
+// everything it wrote afterwards would go to the old, deleted copy.
+func outputIDs(outputs ...io.Writer) []fileutil.FileID {
+	var ids []fileutil.FileID
+	for _, w := range outputs {
+		f, ok := w.(*os.File)
+		if !ok {
+			continue
+		}
+		fi, err := f.Stat()
+		if err != nil || !fi.Mode().IsRegular() {
+			continue
+		}
+		if info, err := fileutil.InfoOf(fi); err == nil {
+			ids = append(ids, info.ID)
+		}
+	}
+	return ids
+}
+
+// rebalanceFolder is a normal run: it rewrites the files in root and returns the exit code. The
+// files with the identities in own (the run's own output) are left alone.
+func rebalanceFolder(o options, root string, stdout io.Writer, log *logrus.Logger, own []fileutil.FileID) int {
 	// The first signal cancels gentle: the files in progress are finished and nothing new is
-	// started. The second cancels hard: the files in progress are abandoned, each left as it was.
+	// started. A second Ctrl+C cancels hard: the files in progress are abandoned, each left as it
+	// was. See stopper for the details.
 	hard, stopNow := context.WithCancel(context.Background())
 	defer stopNow()
 	gentle, stopGently := context.WithCancel(hard)
 	defer stopGently()
-	defer watchSignals(log, stopGently, stopNow)()
+	stop, unwatch := watchSignals(log, stopGently, stopNow)
+	defer unwatch()
 
 	concurrency, note := resolveConcurrency(o.concurrency, runtime.NumCPU())
 	log.Infof("Rebalancing %s", root)
@@ -96,8 +125,8 @@ func rebalanceFolder(o options, root string, stdout io.Writer, log *logrus.Logge
 	if o.oldNoCleanup {
 		log.Info("--no-cleanup-balance is now called --no-cleanup. The old name still works for now.")
 	}
-	if os.Geteuid() != 0 {
-		log.Warn("Not running as root: files owned by other users will be skipped, never changed.")
+	if !isRoot() {
+		log.Warn("Not running as root, so only your own files can be rewritten. Other users' files, and files in folders you can't change, are skipped and left exactly as they are.")
 	}
 
 	lockDir, dbPath, err := statePaths(o.db, root)
@@ -127,9 +156,9 @@ func rebalanceFolder(o options, root string, stdout io.Writer, log *logrus.Logge
 	}()
 	logOpenInfo(log, info, db.Path())
 
-	z := &zfsView{client: newZFSClient(), log: log}
+	z := &zfsView{client: newZFSClient(), log: log, stop: stop}
 	z.lookup(gentle, root)
-	z.checkDataset(gentle)
+	z.checkDataset(gentle, root)
 	if gentle.Err() != nil {
 		return stoppedBeforeStart(log)
 	}
@@ -145,6 +174,7 @@ func rebalanceFolder(o options, root string, stdout io.Writer, log *logrus.Logge
 		HaltOnMissing:    o.haltOnMissing,
 		SizeThresholdMB:  o.sizeThresholdMB,
 		Exclude:          append(db.Files(), filepath.Join(lockDir, lockFileName)),
+		ExcludeIDs:       own,
 		Logger:           log,
 		State:            db,
 	})
@@ -175,9 +205,13 @@ func rebalanceFolder(o options, root string, stdout io.Writer, log *logrus.Logge
 		return stoppedBeforeStart(log)
 	}
 
+	stop.setPhase(phaseCopying)
+	stopWatching := z.watchCloning(before)
 	stopProgress := startProgress(log, r, progressInterval)
 	summary, err := r.Execute(hard, plan)
 	stopProgress()
+	stopWatching()
+	stop.setPhase(phaseFinishing)
 	if err != nil {
 		log.WithField("reason", err.Error()).Error("Couldn't start rewriting files")
 		return exitFailed
@@ -235,6 +269,9 @@ func logOpenInfo(log *logrus.Logger, info database.OpenInfo, dbPath string) {
 		log.Infof("Resuming where the last run stopped (it had rewritten %s).", countFiles(info.PreviousEntries))
 	case info.MissingForResume:
 		log.Warn("There's no saved progress for this folder to resume, so starting from the beginning.")
+	case info.Discarded && info.PreviousRoot != "" && info.PreviousEntries > 0:
+		log.Warnf("Starting fresh. The progress file %s held the saved progress of a different folder, %s (%s rewritten), and that was discarded.",
+			dbPath, info.PreviousRoot, countFiles(info.PreviousEntries))
 	case info.Discarded && info.PreviousEntries > 0:
 		log.Warnf("Starting fresh, so the saved progress of an earlier run (%s rewritten) was discarded. Next time, add --resume to carry on where it stopped.",
 			countFiles(info.PreviousEntries))

@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/astundzia/go-zfs-rebalance/v2/internal/rebalance"
@@ -22,15 +25,28 @@ const (
 	maxListed = 5
 )
 
-// newZFSClient makes the client used to look at ZFS. Tests replace it with a fake.
-var newZFSClient = zfs.NewClient
+// Test seams: the client used to look at ZFS, how the kernel is asked whether a folder is on ZFS,
+// and how often the pool's block-cloning counter is read during a --vdev-report run.
+var (
+	newZFSClient = zfs.NewClient
+	zfsOnPath    = zfs.OnZFS
+	cloneWatch   = 10 * time.Second
+)
+
+// trueNASHint explains why starting zfs or zpool fails with ENOSYS, and what to do instead.
+const trueNASHint = "TrueNAS blocks starting other programs once the sudo session that started this run has ended. " +
+	"Next time, start tmux first without sudo, then run sudo rebalance inside it."
 
 // zfsView is what a run knows about the ZFS dataset holding the folder. Every check is best
 // effort: a problem is logged and the run carries on.
 type zfsView struct {
 	client  *zfs.Client
 	log     *logrus.Logger
-	dataset string // "" when the folder isn't on ZFS, or that couldn't be found out
+	stop    *stopper           // told when the run starts and stops waiting for ZFS; may be nil
+	dataset string             // "" when the folder isn't on ZFS, or that couldn't be found out
+	noPool  string             // why dataset is "", for the vdev report's warning
+	deduped []zfs.DatasetDedup // datasets in the folder with deduplication on
+	blocked bool               // starting the zfs tools was refused, and the user was told why
 }
 
 // ask runs one zfs query, giving up after zfsTimeout.
@@ -40,53 +56,175 @@ func ask[T any](ctx context.Context, query func(context.Context, string) (T, err
 	return query(ctx, arg)
 }
 
-// lookup finds the dataset holding root, warning if it isn't on ZFS.
+// noDataset is why the ZFS dataset holding a folder couldn't be found.
+type noDataset int
+
+const (
+	notOnZFS     noDataset = iota // the folder isn't on ZFS
+	toolsMissing                  // the zfs and zpool commands weren't found
+	execBlocked                   // the system wouldn't start them (TrueNAS once sudo has ended)
+	cantReachZFS                  // the folder is on ZFS, but the tools can't reach ZFS from here
+	lookupFailed                  // anything else
+)
+
+// whyNoDataset works out why DatasetForPath failed for root with err. The kernel is asked
+// whether root is on ZFS, so the answer doesn't depend on the zfs tools working.
+func whyNoDataset(root string, err error) (why noDataset, onZFS bool) {
+	if errors.Is(err, zfs.ErrExecBlocked) {
+		return execBlocked, false
+	}
+	on, statErr := zfsOnPath(root)
+	known := statErr == nil
+	switch {
+	case known && !on:
+		return notOnZFS, false
+	case errors.Is(err, zfs.ErrToolsMissing):
+		return toolsMissing, on
+	case errors.Is(err, zfs.ErrNotZFS) && known:
+		return cantReachZFS, true
+	case errors.Is(err, zfs.ErrNotZFS):
+		return notOnZFS, false
+	}
+	return lookupFailed, on
+}
+
+// lookup finds the dataset holding root, warning if that isn't possible.
 func (z *zfsView) lookup(ctx context.Context, root string) {
 	ds, err := ask(ctx, z.client.DatasetForPath, root)
 	switch {
 	case ctx.Err() != nil:
-	case errors.Is(err, zfs.ErrNotZFS):
-		z.log.Warn("This folder isn't on ZFS, so rewriting files won't rebalance anything.")
-	case err != nil:
-		z.log.WithField("reason", err.Error()).Warn("Couldn't find out which ZFS dataset holds this folder, so the ZFS safety checks were skipped")
-	default:
+		return
+	case err == nil:
 		z.dataset = ds
 		z.log.Debugf("This folder is on the ZFS dataset %s", ds)
+		return
+	}
+	const skipped = "so the ZFS safety checks (snapshots, deduplication and free space) were skipped"
+	switch why, onZFS := whyNoDataset(root, err); why {
+	case notOnZFS:
+		z.noPool = "this folder isn't on ZFS"
+		z.log.Warn("This folder isn't on ZFS, so rewriting files won't rebalance anything.")
+	case toolsMissing:
+		z.noPool = "the zfs and zpool commands weren't found"
+		if onZFS {
+			z.log.Warn("This folder is on ZFS, but the zfs and zpool commands weren't found, " + skipped + ".")
+		} else {
+			z.log.Warn("The zfs and zpool commands weren't found, " + skipped + ".")
+		}
+	case execBlocked:
+		z.noPool = "the zfs tools couldn't be started"
+		z.execBlocked(skipped)
+	case cantReachZFS:
+		z.noPool = "the zfs tools can't reach ZFS from here"
+		z.log.WithField("reason", zfsReason(err)).Warn("This folder is on ZFS, but the zfs tools can't reach ZFS from here (as inside some containers), " + skipped)
+	default:
+		z.noPool = "this folder's ZFS dataset couldn't be found"
+		z.log.WithField("reason", zfsReason(err)).Warn("Couldn't find out which ZFS dataset holds this folder, " + skipped)
 	}
 }
 
-// checkDataset warns about snapshots and deduplication, which both make rebalancing costly.
-func (z *zfsView) checkDataset(ctx context.Context) {
+// execBlocked explains, once per run, that the system refused to start the zfs tools, and what
+// that means for the run (what, such as "so there's no vdev table").
+func (z *zfsView) execBlocked(what string) {
+	if z.blocked {
+		z.log.Debugf("Couldn't start the zfs tools again, %s", what)
+		return
+	}
+	z.blocked = true
+	z.log.Warnf("Couldn't start the zfs tools, %s. %s", what, trueNASHint)
+}
+
+// problem logs that a check couldn't be done because of err, explaining a refused start.
+func (z *zfsView) problem(msg string, err error) {
+	if errors.Is(err, zfs.ErrExecBlocked) {
+		z.execBlocked("so some ZFS checks were skipped")
+		return
+	}
+	z.log.WithField("reason", zfsReason(err)).Debug(msg)
+}
+
+// checkDataset warns about snapshots and deduplication, which both make rebalancing costly. root
+// is the folder being rebalanced, used to tell which datasets below this one are inside it.
+func (z *zfsView) checkDataset(ctx context.Context, root string) {
 	if z.dataset == "" {
 		return
 	}
 	has, err := ask(ctx, z.client.HasSnapshots, z.dataset)
 	switch {
 	case err != nil:
-		z.debug("Couldn't check for snapshots", err)
+		z.problem("Couldn't check for snapshots", err)
 	case has:
 		z.log.Warn("This dataset has snapshots. Every rewritten file will be stored twice until those snapshots are removed — keep an eye on free space.")
 	}
-	dedup, err := ask(ctx, z.client.Dedup, z.dataset)
-	switch {
-	case err != nil:
-		z.debug("Couldn't check whether deduplication is on", err)
-	case dedup != "off" && dedup != "-" && dedup != "":
-		z.log.Warnf("Deduplication is on for this dataset (dedup=%s). Rewriting will be slow, and the new copies may just point back at the old blocks, so the data may not move.", dedup)
+	all, err := ask(ctx, z.client.Dedup, z.dataset)
+	if err != nil {
+		z.problem("Couldn't check whether deduplication is on", err)
+		return
+	}
+	z.deduped = dedupedInside(all, z.dataset, root)
+	if msg := dedupWarning(z.deduped, z.dataset); msg != "" {
+		z.log.Warn(msg)
 	}
 }
 
-// checkSpace warns when free space looks too low for the files that will be copied at once.
+// dedupedInside returns the datasets in all with deduplication on whose files are in root: the
+// dataset holding root, and those mounted inside it. A dataset with a legacy mountpoint can't be
+// placed, so it counts if it is mounted.
+func dedupedInside(all []zfs.DatasetDedup, dataset, root string) []zfs.DatasetDedup {
+	var in []zfs.DatasetDedup
+	for _, d := range all {
+		switch {
+		case d.Dedup == "off" || d.Dedup == "-" || d.Dedup == "":
+		case d.Name == dataset:
+			in = append(in, d)
+		case !d.Mounted:
+		case d.Mountpoint == "legacy" || isInside(d.Mountpoint, root):
+			in = append(in, d)
+		}
+	}
+	return in
+}
+
+// isInside reports whether the absolute path p is dir or inside it.
+func isInside(p, dir string) bool {
+	if !filepath.IsAbs(p) {
+		return false
+	}
+	rel, err := filepath.Rel(dir, p)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, "../")
+}
+
+// dedupWarning is the warning about deduplication for the datasets in deduped, or "".
+func dedupWarning(deduped []zfs.DatasetDedup, dataset string) string {
+	const cost = "Rewriting will be slow, and the new copies may just point back at the old blocks, so the data may not move."
+	switch {
+	case len(deduped) == 0:
+		return ""
+	case len(deduped) == 1 && deduped[0].Name == dataset:
+		return fmt.Sprintf("Deduplication is on for this dataset (dedup=%s). %s", deduped[0].Dedup, cost)
+	case len(deduped) == 1:
+		return fmt.Sprintf("Deduplication is on for %s (dedup=%s), which is inside this folder. %s", deduped[0].Name, deduped[0].Dedup, cost)
+	}
+	names := make([]string, len(deduped))
+	for i, d := range deduped {
+		names[i] = fmt.Sprintf("%s (dedup=%s)", d.Name, d.Dedup)
+	}
+	return fmt.Sprintf("Deduplication is on for %d datasets in this folder: %s. %s", len(deduped), strings.Join(names, ", "), cost)
+}
+
+// checkSpace warns when free space looks too low for the files that will be copied at once. Each
+// copy needs about as much free space as the file takes up on disk now, which for sparse or
+// compressed files is less than their size.
 func (z *zfsView) checkSpace(ctx context.Context, plan *rebalance.Plan, concurrency int) {
-	if z.dataset == "" || plan.LargestFile == 0 {
+	if z.dataset == "" || plan.LargestAllocated <= 0 {
 		return
 	}
 	atOnce := min(concurrency, len(plan.Items))
-	need := 2 * uint64(plan.LargestFile) * uint64(atOnce)
+	need := 2 * uint64(plan.LargestAllocated) * uint64(atOnce)
 	avail, err := ask(ctx, z.client.Available, z.dataset)
 	switch {
 	case err != nil:
-		z.debug("Couldn't check the free space", err)
+		z.problem("Couldn't check the free space", err)
 	case avail < need:
 		z.log.Warnf("Free space is tight: %s is free, and working on %s at a time may need up to %s. Try a lower --concurrency, or free up some space first.",
 			zfs.FormatBytes(avail), countFiles(atOnce), zfs.FormatBytes(need))
@@ -96,26 +234,35 @@ func (z *zfsView) checkSpace(ctx context.Context, plan *rebalance.Plan, concurre
 // vdevBefore is the pool as it was before the run, for the comparison afterwards.
 type vdevBefore struct {
 	dist     zfs.Distribution
-	bclone   uint64
-	bcloneOK bool
+	bclone   uint64 // the block-cloning counter at the start
+	bcloneOK bool   // the pool has a block-cloning counter
+	// bclonePeak is the highest the counter was seen during the run. Only watchCloning's
+	// goroutine changes it, and only until the function it returns has returned.
+	bclonePeak uint64
 }
 
 // reportBefore prints how full each vdev is and returns it, or nil if that couldn't be read.
 func (z *zfsView) reportBefore(ctx context.Context, stdout io.Writer) *vdevBefore {
 	if z.dataset == "" {
-		z.log.Warn("Skipping the vdev report, since this folder's ZFS pool couldn't be found.")
+		z.log.Warnf("Skipping the vdev report, because %s.", z.noPool)
 		return nil
 	}
 	pool := zfs.PoolOf(z.dataset)
 	d, err := ask(ctx, z.client.Distribution, pool)
-	if err != nil {
-		if ctx.Err() == nil {
-			z.log.WithField("reason", err.Error()).Warn("Couldn't read how full each vdev is, so there will be no vdev report")
-		}
+	switch {
+	case err == nil:
+	case ctx.Err() != nil:
+		return nil
+	case errors.Is(err, zfs.ErrExecBlocked):
+		z.execBlocked("so there will be no vdev report")
+		return nil
+	default:
+		z.log.WithField("reason", zfsReason(err)).Warn("Couldn't read how full each vdev is, so there will be no vdev report")
 		return nil
 	}
 	b := &vdevBefore{dist: d}
 	b.bclone, b.bcloneOK = z.bcloneUsed(ctx, pool)
+	b.bclonePeak = b.bclone
 	fmt.Fprintln(stdout, "Before:")
 	if err := zfs.RenderReport(stdout, d); err != nil {
 		z.debug("Couldn't print the vdev report", err)
@@ -124,16 +271,49 @@ func (z *zfsView) reportBefore(ctx context.Context, stdout io.Writer) *vdevBefor
 	return b
 }
 
+// watchCloning reads the pool's block-cloning counter every cloneWatch until the returned function
+// is called, keeping the highest value in b. A file that was cloned instead of rewritten raises the
+// counter only until it replaces the original, which frees the original's share again, so the
+// counters at the start and end can be the same even when every file was cloned.
+func (z *zfsView) watchCloning(b *vdevBefore) (stop func()) {
+	if b == nil || !b.bcloneOK {
+		return func() {}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		ticker := time.NewTicker(cloneWatch)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			if n, ok := z.bcloneUsed(ctx, b.dist.Pool); ok {
+				b.bclonePeak = max(b.bclonePeak, n)
+			}
+		}
+	})
+	return func() {
+		cancel()
+		wg.Wait()
+	}
+}
+
 // reportAfter prints how each vdev changed during the run. It first gives ZFS up to freeWait to
 // release the old copies' space; Ctrl+C skips the wait (gentle is checked first, so after one
 // Ctrl+C during the run the wait can still be skipped with another).
 func (z *zfsView) reportAfter(gentle, hard context.Context, stdout io.Writer, before *vdevBefore) {
+	const noTable = "so there's no before-and-after table"
 	pool := before.dist.Pool
 	var notes []string
 	waited := false
 	if ctx := firstLive(gentle, hard); ctx != nil {
+		z.stop.setPhase(phaseWaiting)
 		z.log.Info("Waiting for ZFS to finish freeing the old copies' space, so the table is accurate (up to 2 minutes; press Ctrl+C to skip)…")
 		timedOut, err := z.client.WaitForFrees(ctx, pool, freeWait)
+		z.stop.setPhase(phaseFinishing)
 		switch {
 		case timedOut:
 			notes = append(notes, "ZFS was still freeing space after 2 minutes, so the old vdevs may look fuller than they really are")
@@ -151,17 +331,30 @@ func (z *zfsView) reportAfter(gentle, hard context.Context, stdout io.Writer, be
 	// Read the pool even after Ctrl+C: the table is quick, and the run's result is worth seeing.
 	ctx := context.WithoutCancel(hard)
 	after, err := ask(ctx, z.client.Distribution, pool)
-	if err != nil {
-		z.log.WithField("reason", err.Error()).Warn("Couldn't read how full each vdev is after the run, so there's no comparison")
+	switch {
+	case err == nil:
+	case errors.Is(err, zfs.ErrExecBlocked):
+		z.execBlocked(noTable)
+		return
+	default:
+		z.log.WithField("reason", zfsReason(err)).Warn("Couldn't read how full each vdev is after the run, " + noTable)
 		return
 	}
 	if held, err := ask(ctx, z.client.SnapshotBytes, z.dataset); err != nil {
-		z.debug("Couldn't check how much space snapshots hold", err)
+		z.problem("Couldn't check how much space snapshots hold", err)
 	} else if held > 0 {
 		notes = append(notes, fmt.Sprintf("snapshots hold %s of old data, so the old vdevs won't shrink until those snapshots are removed", zfs.FormatBytes(held)))
 	}
-	if now, ok := z.bcloneUsed(ctx, pool); ok && before.bcloneOK && now > before.bclone {
-		notes = append(notes, fmt.Sprintf("block cloning grew by %s during the run; if nothing else was copying files, some files may have been cloned instead of rewritten", zfs.FormatBytes(now-before.bclone)))
+	if now, ok := z.bcloneUsed(ctx, pool); ok && before.bcloneOK {
+		if peak := max(before.bclonePeak, now); peak > before.bclone {
+			notes = append(notes, fmt.Sprintf("block cloning grew by %s during the run; if nothing else was copying files, some files may have been cloned instead of rewritten", zfs.FormatBytes(peak-before.bclone)))
+		}
+	}
+	switch n := len(z.deduped); {
+	case n == 1:
+		notes = append(notes, fmt.Sprintf("deduplication is on for %s, so the files rewritten there may not have moved", z.deduped[0].Name))
+	case n > 1:
+		notes = append(notes, fmt.Sprintf("deduplication is on for %d datasets in this folder, so the files rewritten there may not have moved", n))
 	}
 	fmt.Fprintln(stdout, "Before and after:")
 	if err := zfs.RenderComparison(stdout, before.dist, after, notes); err != nil {
@@ -191,7 +384,24 @@ func (z *zfsView) bcloneUsed(ctx context.Context, pool string) (uint64, bool) {
 }
 
 func (z *zfsView) debug(msg string, err error) {
-	z.log.WithField("reason", err.Error()).Debug(msg)
+	z.log.WithField("reason", zfsReason(err)).Debug(msg)
+}
+
+// zfsReason describes in plain words why a zfs or zpool command failed.
+func zfsReason(err error) string {
+	var cmdErr *zfs.CommandError
+	switch {
+	case errors.Is(err, zfs.ErrToolsMissing):
+		return "the zfs and zpool commands weren't found"
+	case errors.Is(err, zfs.ErrExecBlocked):
+		return "the system wouldn't start the zfs tools"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "the zfs tools took too long to answer"
+	case errors.As(err, &cmdErr) && cmdErr.Stderr != "":
+		name, _, _ := strings.Cut(cmdErr.Command, " ")
+		return name + " said: " + cmdErr.Stderr
+	}
+	return err.Error()
 }
 
 // report is --report: print how full each vdev of the folder's pool is, and change nothing.
@@ -199,21 +409,29 @@ func report(root string, stdout, stderr io.Writer) int {
 	ctx := context.Background()
 	client := newZFSClient()
 	ds, err := ask(ctx, client.DatasetForPath, root)
-	switch {
-	case errors.Is(err, zfs.ErrNotZFS):
-		fmt.Fprintf(stderr, "rebalance: %q isn't on ZFS (or the zfs tools aren't installed here), so there's no pool to report on\n", root)
+	if err != nil {
+		switch why, _ := whyNoDataset(root, err); why {
+		case notOnZFS:
+			fmt.Fprintf(stderr, "rebalance: %q isn't on ZFS, so there's no pool to report on\n", root)
+		case toolsMissing:
+			fmt.Fprintf(stderr, "rebalance: the zfs and zpool commands weren't found, so there's no pool to report on. Run this where the ZFS tools are installed\n")
+		case execBlocked:
+			fmt.Fprintf(stderr, "rebalance: couldn't start the zfs tools, so there's no report. TrueNAS blocks starting other programs once the sudo session that started this has ended; run sudo rebalance --report straight from your shell\n")
+		case cantReachZFS:
+			fmt.Fprintf(stderr, "rebalance: %q is on ZFS, but the zfs tools can't reach ZFS from here (%s), so there's no report\n", root, zfsReason(err))
+		default:
+			fmt.Fprintf(stderr, "rebalance: couldn't find out which ZFS dataset holds %q (%s)\n", root, zfsReason(err))
+			return exitFailed
+		}
 		return exitUsage
-	case err != nil:
-		fmt.Fprintf(stderr, "rebalance: couldn't find out which ZFS dataset holds %q: %v\n", root, err)
-		return exitFailed
 	}
 	d, err := ask(ctx, client.Distribution, zfs.PoolOf(ds))
 	if err != nil {
-		fmt.Fprintf(stderr, "rebalance: couldn't read how full each vdev is: %v\n", err)
+		fmt.Fprintf(stderr, "rebalance: couldn't read how full each vdev is (%s)\n", zfsReason(err))
 		return exitFailed
 	}
 	if err := zfs.RenderReport(stdout, d); err != nil {
-		fmt.Fprintf(stderr, "rebalance: couldn't print the report: %v\n", err)
+		fmt.Fprintf(stderr, "rebalance: couldn't print the report (%v)\n", err)
 		return exitFailed
 	}
 	return exitOK

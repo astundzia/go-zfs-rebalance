@@ -59,6 +59,15 @@ func TestFormatterLines(t *testing.T) {
 			"3:04:05 PM  Progress: 1 of 2 files\n"},
 		{"listed", logrus.WarnLevel, "", logrus.Fields{"op": opListed, "path": "old/x.balance"},
 			"3:04:05 PM      old/x.balance\n"},
+		{"rebalanced hardlinked file", logrus.InfoLevel, "Rebalanced, keeping its 3 hardlinked names together",
+			logrus.Fields{"op": "rebalanced", "path": "links/a", "names": []string{"links/a", "links/b", "c"}, "size": int64(5)},
+			"3:04:05 PM  ✓ rebalanced  links/a (+2 hardlinked names)  5 B\n"},
+		{"skipped hardlinked file", logrus.InfoLevel, "Skipped",
+			logrus.Fields{"op": "skipped", "path": "a", "names": []string{"a", "b"}, "reason": "the file's hardlinks changed"},
+			"3:04:05 PM  ! skipped  a (+1 hardlinked name)  the file's hardlinks changed\n"},
+		{"failed hardlinked file", logrus.ErrorLevel, "Couldn't rebalance",
+			logrus.Fields{"op": "failed", "path": "a", "names": []string{"a", "b"}, "reason": "r"},
+			"3:04:05 PM  ✗ failed  a (+1 hardlinked name)  r\n"},
 	}
 	f := &logFormatter{}
 	for _, tt := range tests {
@@ -88,6 +97,26 @@ func TestFormatterEscapesText(t *testing.T) {
 		if escape(s) != s {
 			t.Errorf("escape(%q) = %q, want it unchanged", s, escape(s))
 		}
+	}
+}
+
+// TestFormatterListsHardlinkedNamesWithDebug checks that --debug lists every name of a hardlinked
+// file, escaped, below its line.
+func TestFormatterListsHardlinkedNamesWithDebug(t *testing.T) {
+	var buf syncBuffer
+	log := newLogger(&buf, true, false)
+	log.WithFields(logrus.Fields{"op": "rebalanced", "path": "a/x", "names": []string{"a/x", "b/y\x1b", "z"}, "size": int64(1)}).Info("Rebalanced")
+	lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
+	if len(lines) != 3 || !strings.HasSuffix(lines[0], "✓ rebalanced  a/x (+2 hardlinked names)  1 B") ||
+		!strings.HasSuffix(lines[1], "      also b/y\\x1b") || !strings.HasSuffix(lines[2], "      also z") {
+		t.Errorf("got:\n%s", buf.String())
+	}
+
+	buf = syncBuffer{}
+	log = newLogger(&buf, false, false)
+	log.WithFields(logrus.Fields{"op": "rebalanced", "path": "a/x", "names": []string{"a/x", "z"}, "size": int64(1)}).Info("Rebalanced")
+	if strings.Contains(buf.String(), "also") {
+		t.Errorf("names listed without --debug: %q", buf.String())
 	}
 }
 

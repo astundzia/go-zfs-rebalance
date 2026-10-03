@@ -62,8 +62,8 @@ func wantColor(w io.Writer) bool {
 //	3:04:05 PM  ✓ rebalanced  photos/IMG 1.jpg  12.3 MiB at 110.5 MB/s
 //	3:04:05 PM  ! skipped  photos/b.jpg  the file changed while it was being copied — nothing was changed
 //
-// It builds the line from the entry's structured fields ("op", "path", "size", "mbps", "reason")
-// and never picks apart the message text. All text is escaped, so a file name can't send control
+// It builds the line from the entry's structured fields ("op", "path", "names", "size", "mbps",
+// "reason") and never picks apart the message text. All text is escaped, so a file name can't send control
 // codes to the terminal.
 type logFormatter struct {
 	filenameOnly bool
@@ -79,9 +79,15 @@ func (f *logFormatter) Format(e *logrus.Entry) ([]byte, error) {
 	op, _ := e.Data["op"].(string)
 	file, hasPath := e.Data["path"].(string)
 	reason, _ := e.Data["reason"].(string)
+	// A hardlinked file is named by its first name, and "names" holds all of them.
+	names, _ := e.Data["names"].([]string)
+	item := f.renderPath(file)
+	if n := len(names) - 1; n > 0 {
+		item += fmt.Sprintf(" (+%d hardlinked %s)", n, choose(n, "name", "names"))
+	}
 	switch op {
 	case "rebalanced":
-		b.WriteString(f.paint(ansiGreen, "✓ rebalanced") + "  " + f.renderPath(file))
+		b.WriteString(f.paint(ansiGreen, "✓ rebalanced") + "  " + item)
 		if size, ok := e.Data["size"].(int64); ok && size >= 0 {
 			b.WriteString("  " + zfs.FormatBytes(uint64(size)))
 			// The speed of copying a small file says more about overheads than the pool.
@@ -90,12 +96,12 @@ func (f *logFormatter) Format(e *logrus.Entry) ([]byte, error) {
 			}
 		}
 	case "skipped":
-		b.WriteString(f.paint(ansiYellow, "! skipped") + "  " + f.renderPath(file))
+		b.WriteString(f.paint(ansiYellow, "! skipped") + "  " + item)
 		if reason != "" {
 			b.WriteString("  " + escape(reason))
 		}
 	case "failed":
-		b.WriteString(f.paint(ansiRed, "✗ failed") + "  " + f.renderPath(file))
+		b.WriteString(f.paint(ansiRed, "✗ failed") + "  " + item)
 		if reason != "" {
 			b.WriteString("  " + escape(reason))
 		}
@@ -113,13 +119,19 @@ func (f *logFormatter) Format(e *logrus.Entry) ([]byte, error) {
 		}
 		b.WriteString(f.paint(color, text))
 		if hasPath {
-			b.WriteString("  " + f.renderPath(file))
+			b.WriteString("  " + item)
 		}
 		if reason != "" {
 			b.WriteString("  " + escape(reason))
 		}
 	}
 	b.WriteByte('\n')
+	// With --debug, every other name of a hardlinked file is listed below it.
+	if len(names) > 1 && e.Logger != nil && e.Logger.IsLevelEnabled(logrus.DebugLevel) {
+		for _, name := range names[1:] {
+			b.WriteString(f.paint(ansiDim, e.Time.Format("3:04:05 PM")) + "      also " + f.renderPath(name) + "\n")
+		}
+	}
 	return []byte(b.String()), nil
 }
 

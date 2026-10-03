@@ -26,10 +26,17 @@ type fakeZFS struct {
 	mu         sync.Mutex
 	answers    map[string][]string // command line -> outputs for successive calls; the last repeats
 	unexpected []string
+	// respond, if set, is asked first; it answers a command by returning handled = true.
+	respond func(cmdline string) (out string, handled bool, err error)
 }
 
 func (f *fakeZFS) Run(_ context.Context, name string, args ...string) ([]byte, error) {
 	cmdline := strings.Join(append([]string{name}, args...), " ")
+	if f.respond != nil {
+		if out, ok, err := f.respond(cmdline); ok {
+			return []byte(out), err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	outs, ok := f.answers[cmdline]
@@ -252,7 +259,7 @@ func TestRunRewritesEveryFileThenResumes(t *testing.T) {
 		"rebalanced 4 files")
 	mustNotContain(t, errOut, "\x1b", "discarded", "Resuming")
 	if os.Geteuid() != 0 {
-		mustContain(t, errOut, "Not running as root: files owned by other users will be skipped, never changed.")
+		mustContain(t, errOut, "! Not running as root, so only your own files can be rewritten. Other users' files, and files in folders you can't change, are skipped and left exactly as they are.")
 	}
 
 	// --resume: everything is already done.
@@ -446,7 +453,9 @@ func TestHaltOnMissingFile(t *testing.T) {
 	checkTree(t, root, []string{"a", "c", "d"})
 }
 
-func TestFailedFileExitsOne(t *testing.T) {
+// TestUnwritableFolderIsSkippedWithoutRoot checks that, without root, a file in a folder the user
+// can't change is skipped, with a hint to use sudo rather than --resume, and the run exits 0.
+func TestUnwritableFolderIsSkippedWithoutRoot(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root can write in a read-only folder")
 	}
@@ -460,14 +469,15 @@ func TestFailedFileExitsOne(t *testing.T) {
 	before := inodeOf(t, filepath.Join(ro, "locked.txt"))
 
 	code, _, errOut := runCLI(t, root)
-	if code != exitFailed {
-		t.Fatalf("exit %d, want 1", code)
+	if code != exitOK {
+		t.Fatalf("exit %d, want 0", code)
 	}
-	mustContain(t, errOut, "✗ failed  ro/locked.txt  ", "rebalanced 1 of 2 files",
-		"! 1 file couldn't be rebalanced — see the messages above. Each was left exactly as it was.",
-		"To try those files again, run the same command again with --resume added.")
+	mustContain(t, errOut, "! skipped  ro/locked.txt  no permission to replace it (run with sudo to include it)",
+		"rebalanced 1 of 2 files", "Skipped 1 file: 1 file you aren't allowed to replace.",
+		"To include the 1 file you don't have permission to change, run it again with sudo (that run starts from the beginning).")
+	mustNotContain(t, errOut, "--resume", "couldn't be rebalanced")
 	if inodeOf(t, filepath.Join(ro, "locked.txt")) != before {
-		t.Error("the file that failed was changed")
+		t.Error("the skipped file was changed")
 	}
 	checkTree(t, root, []string{"ok.txt", "ro/locked.txt"})
 }
@@ -494,7 +504,7 @@ func TestLeftoversAreReported(t *testing.T) {
 		"      o1.balance\n", "      o5.balance\n", "! …and 2 more",
 		"Found a file ending in .balance next to one with the same name without it.",
 		"! Found a temporary file left behind by an interrupted run. It was kept because of --no-cleanup",
-		"rebalanced 2 files", "7 leftover .balance file")
+		"rebalanced 2 files", "7 leftover .balance files.")
 	mustNotContain(t, errOut, "o6.balance")
 	after := inodes(t, root, names)
 	for _, name := range names {
@@ -537,7 +547,7 @@ func TestReportNotOnZFS(t *testing.T) {
 	if code != exitUsage || out != "" {
 		t.Errorf("exit %d, stdout %q; want exit 2 and no table", code, out)
 	}
-	mustContain(t, errOut, fmt.Sprintf("rebalance: %q isn't on ZFS (or the zfs tools aren't installed here), so there's no pool to report on", root))
+	mustContain(t, errOut, fmt.Sprintf("rebalance: %q isn't on ZFS, so there's no pool to report on", root))
 	if _, err := os.Stat(stateDir); !os.IsNotExist(err) {
 		t.Errorf("--report created the state folder (%v)", err)
 	}
@@ -580,13 +590,13 @@ func TestVdevReportAndSafetyChecks(t *testing.T) {
 	f := &fakeZFS{answers: map[string][]string{
 		"zfs list -H -o name -- " + root:                        {"tank/media\n"},
 		"zfs list -H -t snapshot -r -o name -s name tank/media": {"tank/media@daily-1\n"},
-		"zfs get -H -o value dedup tank/media":                  {"sha256,verify\n"},
-		"zfs get -Hp -o value available tank/media":             {"10\n"},
-		"zpool list -v -H -p -o name,size,allocated,free tank":  {zpoolMirrors, after},
-		"zpool get -Hp -o value bcloneused tank":                {"0\n", "1048576\n"},
-		"zpool sync tank":                                       {""},
-		"zpool get -Hp -o value freeing tank":                   {"0\n"},
-		"zfs get -Hp -r -o value usedbysnapshots tank/media":    {"4096\n-\n"},
+		dedupCmd: {"tank/media\tdedup\tsha256,verify\ntank/media\tmountpoint\t" + root + "\ntank/media\tmounted\tyes\n"},
+		"zfs get -Hp -o value available tank/media":            {"10\n"},
+		"zpool list -v -H -p -o name,size,allocated,free tank": {zpoolMirrors, after},
+		"zpool get -Hp -o value bcloneused tank":               {"0\n", "1048576\n"},
+		"zpool sync tank":                                      {""},
+		"zpool get -Hp -o value freeing tank":                  {"0\n"},
+		"zfs get -Hp -r -o value usedbysnapshots tank/media":   {"4096\n-\n"},
 	}}
 	useZFS(t, f)
 
@@ -613,7 +623,8 @@ func TestVdevReportAndSafetyChecks(t *testing.T) {
 		"mirror-1    12.0% -> 24.5%     +931.3 GiB\n" +
 		"spread      69.0 pts -> 31.4 pts\n" +
 		"note: snapshots hold 4.0 KiB of old data, so the old vdevs won't shrink until those snapshots are removed\n" +
-		"note: block cloning grew by 1.0 MiB during the run; if nothing else was copying files, some files may have been cloned instead of rewritten\n"
+		"note: block cloning grew by 1.0 MiB during the run; if nothing else was copying files, some files may have been cloned instead of rewritten\n" +
+		"note: deduplication is on for tank/media, so the files rewritten there may not have moved\n"
 	if out != want {
 		t.Errorf("stdout:\n%s\nwant:\n%s", out, want)
 	}
@@ -621,6 +632,9 @@ func TestVdevReportAndSafetyChecks(t *testing.T) {
 		t.Errorf("unexpected commands: %q", u)
 	}
 }
+
+// dedupCmd is the command that lists the dedup setting of tank/media and the datasets below it.
+const dedupCmd = "zfs get -r -H -t filesystem -o name,property,value dedup,mountpoint,mounted tank/media"
 
 func TestVdevReportWhenNotOnZFS(t *testing.T) {
 	isolateState(t)
@@ -630,7 +644,7 @@ func TestVdevReportWhenNotOnZFS(t *testing.T) {
 		t.Fatalf("exit %d, stdout %q; want 0 and no table", code, out)
 	}
 	mustContain(t, errOut, "! This folder isn't on ZFS, so rewriting files won't rebalance anything.",
-		"! Skipping the vdev report", "rebalanced 1 file")
+		"! Skipping the vdev report, because this folder isn't on ZFS.", "rebalanced 1 file")
 }
 
 func TestVdevComparisonAfterCtrlC(t *testing.T) {

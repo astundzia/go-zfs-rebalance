@@ -10,15 +10,25 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/astundzia/go-zfs-rebalance/v2/internal/fileutil"
 	"github.com/astundzia/go-zfs-rebalance/v2/internal/zfs"
 	"github.com/sirupsen/logrus"
 )
 
+// helperEnv makes the test binary run as the rebalance command itself, with real signal handling.
+// Its arguments are then the command's.
+const helperEnv = "REBALANCE_CMD_HELPER"
+
 func TestMain(m *testing.M) {
-	// Keep the tests hermetic: no real signal handlers, and no real zfs or zpool commands even on
-	// a computer that has ZFS. Tests that need either replace these again.
-	notifySignals = func(chan<- os.Signal) func() { return func() {} }
+	// Never run real zfs or zpool commands, even on a computer that has ZFS. Tests that need them
+	// replace this again.
 	newZFSClient = func() *zfs.Client { return &zfs.Client{Runner: noZFS{}} }
+	if os.Getenv(helperEnv) != "" {
+		// Be the rebalance command itself, with real signal handling (see TestBrokenPipeStopsGently).
+		os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+	}
+	// Keep the tests hermetic: no real signal handlers. Tests that need signals replace this again.
+	notifySignals = func(chan<- os.Signal) func() { return func() {} }
 	os.Exit(m.Run())
 }
 
@@ -97,5 +107,31 @@ func mustNotContain(t *testing.T, got string, unwanted ...string) {
 		if strings.Contains(got, u) {
 			t.Errorf("output unexpectedly contains %q", u)
 		}
+	}
+}
+
+func TestOutputIDs(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := fileutil.InfoOf(fi)
+	if err != nil {
+		t.Fatal(err)
+	}
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer devNull.Close()
+
+	got := outputIDs(&bytes.Buffer{}, devNull, f)
+	if len(got) != 1 || got[0] != want.ID {
+		t.Errorf("outputIDs = %v, want just the regular file's %v", got, want.ID)
 	}
 }

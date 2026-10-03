@@ -117,17 +117,59 @@ func TestLogSummary(t *testing.T) {
 			[]string{"Finished in under a second: rebalanced 1 of 3 files.",
 				"! 2 files couldn't be rebalanced — see the messages above. Each was left exactly as it was.",
 				"To try those files again, run the same command again with --resume added.",
-				"To include the 1 file owned by other users, run as root (with sudo)."},
+				"Skipped 1 file: 1 file owned by someone else.",
+				"To include the 1 file owned by other users, run it again with sudo (that run starts from the beginning)."},
+			nil},
+		{"others' files without root",
+			rebalance.Summary{Total: 1000, Rebalanced: 1000,
+				Skipped: map[rebalance.SkipReason]int{rebalance.SkipOwner: 1200, rebalance.SkipNoPermission: 34}},
+			options{resume: true},
+			[]string{"Skipped 1,234 files: 1,200 files owned by someone else, 34 files you aren't allowed to replace.",
+				"To include the 1,234 files you don't have permission to change, run it again with sudo (that run starts from the beginning)."},
+			[]string{"--resume", "!"}},
+		{"plurals",
+			rebalance.Summary{Total: 2, Rebalanced: 2, Skipped: map[rebalance.SkipReason]int{
+				rebalance.SkipOrphanBalance: 2, rebalance.SkipHardlinksOutside: 1, rebalance.SkipImmutable: 1}},
+			options{},
+			[]string{"Skipped 4 files: 2 leftover .balance files, 1 file with hardlinks outside the folder, 1 file marked immutable or append-only."},
+			nil},
+		{"folder times not put back",
+			rebalance.Summary{Total: 2, Rebalanced: 2, FolderTimesNotRestored: 1},
+			options{},
+			[]string{"! Couldn't put back the modified time of 1 folder, so it shows when the run changed it — see the warnings above."},
+			nil},
+		{"several folder times not put back",
+			rebalance.Summary{Total: 2, Rebalanced: 2, FolderTimesNotRestored: 1500},
+			options{},
+			[]string{"! Couldn't put back the modified time of 1,500 folders, so they show when the run changed them — see the warnings above."},
 			nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			runAsRoot(t, false)
 			log, buf := testLogger(logrus.InfoLevel)
 			logSummary(log, tt.s, tt.o)
 			mustContain(t, buf.String(), tt.want...)
 			mustNotContain(t, buf.String(), tt.notWant...)
 		})
 	}
+}
+
+// runAsRoot makes the run believe it does, or doesn't, have root.
+func runAsRoot(t *testing.T, root bool) {
+	t.Helper()
+	old := isRoot
+	isRoot = func() bool { return root }
+	t.Cleanup(func() { isRoot = old })
+}
+
+// TestNoSudoHintAsRoot checks that a run that already has root isn't told to use sudo.
+func TestNoSudoHintAsRoot(t *testing.T) {
+	runAsRoot(t, true)
+	log, buf := testLogger(logrus.InfoLevel)
+	logSummary(log, rebalance.Summary{Total: 1, Rebalanced: 1, Skipped: map[rebalance.SkipReason]int{rebalance.SkipOwner: 1}}, options{})
+	mustContain(t, buf.String(), "Skipped 1 file: 1 file owned by someone else.")
+	mustNotContain(t, buf.String(), "sudo")
 }
 
 func TestExitCode(t *testing.T) {

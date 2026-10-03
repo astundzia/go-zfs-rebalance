@@ -3,9 +3,13 @@ package zfs
 import (
 	"context"
 	"errors"
+	"io/fs"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -77,14 +81,25 @@ func TestDatasetForPath(t *testing.T) {
 	t.Run("zfs missing", func(t *testing.T) {
 		r := failWith(&exec.Error{Name: "zfs", Err: exec.ErrNotFound})
 		_, err := (&Client{Runner: r}).DatasetForPath(ctx, "/mnt/tank")
-		require.ErrorIs(t, err, ErrNotZFS)
+		require.ErrorIs(t, err, ErrToolsMissing)
 		require.ErrorIs(t, err, exec.ErrNotFound)
+		require.NotErrorIs(t, err, ErrNotZFS, "missing tools say nothing about the folder")
 	})
 
 	t.Run("zfs missing for real", func(t *testing.T) {
 		c := &Client{Runner: ExecRunner{}}
 		_, err := c.run(ctx, "go-zfs-rebalance-no-such-command", "list")
-		require.ErrorIs(t, err, ErrNotZFS)
+		require.ErrorIs(t, err, ErrToolsMissing)
+	})
+
+	t.Run("starting zfs is refused", func(t *testing.T) {
+		// What TrueNAS gives once the sudo session that started the run has ended.
+		r := failWith(&CommandError{Command: "zfs list -H -o name -- /mnt/tank",
+			Err: &fs.PathError{Op: "fork/exec", Path: "/sbin/zfs", Err: syscall.ENOSYS}})
+		_, err := (&Client{Runner: r}).DatasetForPath(ctx, "/mnt/tank")
+		require.ErrorIs(t, err, ErrExecBlocked)
+		require.NotErrorIs(t, err, ErrNotZFS)
+		require.NotErrorIs(t, err, ErrToolsMissing)
 	})
 
 	t.Run("other failure is not ErrNotZFS", func(t *testing.T) {
@@ -252,10 +267,27 @@ func TestHasSnapshots(t *testing.T) {
 }
 
 func TestDedup(t *testing.T) {
-	r := answer(t, map[string]string{"zfs get -H -o value dedup tank/media": "sha256,verify\n"})
+	const cmd = "zfs get -r -H -t filesystem -o name,property,value dedup,mountpoint,mounted tank/media"
+	r := answer(t, map[string]string{cmd: "tank/media\tdedup\toff\n" +
+		"tank/media\tmountpoint\t/mnt/tank/media\n" +
+		"tank/media\tmounted\tyes\n" +
+		"tank/media/kid\tdedup\tsha256,verify\n" +
+		"tank/media/kid\tmountpoint\t/mnt/tank/media/kid\n" +
+		"tank/media/kid\tmounted\tyes\n" +
+		"tank/media/old\tdedup\ton\n" +
+		"tank/media/old\tmountpoint\tlegacy\n" +
+		"tank/media/old\tmounted\tno\n"})
 	got, err := (&Client{Runner: r}).Dedup(context.Background(), "tank/media")
 	require.NoError(t, err)
-	require.Equal(t, "sha256,verify", got)
+	require.Equal(t, []DatasetDedup{
+		{Name: "tank/media", Dedup: "off", Mountpoint: "/mnt/tank/media", Mounted: true},
+		{Name: "tank/media/kid", Dedup: "sha256,verify", Mountpoint: "/mnt/tank/media/kid", Mounted: true},
+		{Name: "tank/media/old", Dedup: "on", Mountpoint: "legacy"},
+	}, got)
+
+	r = answer(t, map[string]string{cmd: "tank/media\tdedup\n"})
+	_, err = (&Client{Runner: r}).Dedup(context.Background(), "tank/media")
+	require.ErrorContains(t, err, "unexpected line")
 }
 
 func TestAvailable(t *testing.T) {
@@ -334,6 +366,10 @@ func TestExecRunner(t *testing.T) {
 		require.Equal(t, 3, exitErr.ExitCode())
 		require.ErrorContains(t, err, "sh -c")
 		require.ErrorContains(t, err, ": cannot open: no such pool (exit status 3)")
+		var cmdErr *CommandError
+		require.ErrorAs(t, err, &cmdErr)
+		require.Equal(t, "cannot open: no such pool", cmdErr.Stderr)
+		require.True(t, strings.HasPrefix(cmdErr.Command, "sh -c "), cmdErr.Command)
 	})
 
 	t.Run("long stderr is shortened", func(t *testing.T) {
@@ -346,6 +382,23 @@ func TestExecRunner(t *testing.T) {
 		require.ErrorIs(t, err, exec.ErrNotFound)
 	})
 
+	t.Run("found in sbin when not on PATH", func(t *testing.T) {
+		sbin, sh := t.TempDir(), mustLookPath(t, "sh")
+		writeScript(t, filepath.Join(sbin, "fakezpool"), "#!"+sh+"\necho \"pool $1\"\n", 0o755)
+		writeScript(t, filepath.Join(sbin, "notrunnable"), "#!"+sh+"\necho hi\n", 0o644)
+		old := sbinDirs
+		sbinDirs = []string{filepath.Join(sbin, "missing"), sbin}
+		t.Cleanup(func() { sbinDirs = old })
+		t.Setenv("PATH", t.TempDir())
+
+		out, err := ExecRunner{}.Run(ctx, "fakezpool", "tank")
+		require.NoError(t, err)
+		require.Equal(t, "pool tank\n", string(out))
+
+		_, err = ExecRunner{}.Run(ctx, "notrunnable")
+		require.ErrorIs(t, err, exec.ErrNotFound)
+	})
+
 	t.Run("ctx cancel kills the command", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 		defer cancel()
@@ -354,4 +407,46 @@ func TestExecRunner(t *testing.T) {
 		require.Error(t, err)
 		require.Less(t, time.Since(start), 5*time.Second)
 	})
+}
+
+func mustLookPath(t *testing.T, name string) string {
+	t.Helper()
+	p, err := exec.LookPath(name)
+	if err != nil {
+		t.Skipf("needs %s", name)
+	}
+	return p
+}
+
+func writeScript(t *testing.T, path, content string, mode os.FileMode) {
+	t.Helper()
+	require.NoError(t, os.WriteFile(path, []byte(content), mode))
+}
+
+// TestStartRefused checks that every query reports a refused start (ENOSYS)
+// as ErrExecBlocked, so the caller can explain it.
+func TestStartRefused(t *testing.T) {
+	ctx := context.Background()
+	c := &Client{Runner: failWith(&CommandError{Command: "zpool",
+		Err: &fs.PathError{Op: "fork/exec", Path: "/sbin/zpool", Err: syscall.ENOSYS}})}
+	_, err := c.Distribution(ctx, "tank")
+	require.ErrorIs(t, err, ErrExecBlocked)
+	_, err = c.WaitForFrees(ctx, "tank", time.Minute)
+	require.ErrorIs(t, err, ErrExecBlocked)
+	_, _, err = c.BcloneUsed(ctx, "tank")
+	require.ErrorIs(t, err, ErrExecBlocked)
+}
+
+func TestOnZFS(t *testing.T) {
+	on, err := OnZFS(t.TempDir())
+	require.NoError(t, err)
+	t.Logf("the temporary folder is on ZFS: %v", on)
+	if dir := os.Getenv("REBALANCE_TEST_DIR"); dir != "" {
+		on, err := OnZFS(dir)
+		require.NoError(t, err)
+		t.Logf("REBALANCE_TEST_DIR %s is on ZFS: %v", dir, on)
+	}
+
+	_, err = OnZFS(filepath.Join(t.TempDir(), "missing"))
+	require.ErrorIs(t, err, fs.ErrNotExist)
 }

@@ -93,6 +93,10 @@ func logSummary(log *logrus.Logger, s rebalance.Summary, o options) {
 	if s.Failed > 0 {
 		log.Warnf("%s couldn't be rebalanced — see the messages above. Each was left exactly as it was.", countFiles(s.Failed))
 	}
+	if n := s.FolderTimesNotRestored; n > 0 {
+		log.Warnf("Couldn't put back the modified time of %s, so %s when the run changed %s — see the warnings above.",
+			choose(n, "1 folder", thousands(n)+" folders"), choose(n, "it shows", "they show"), choose(n, "it", "them"))
+	}
 
 	again := "run the same command again with --resume added"
 	if o.resume {
@@ -109,8 +113,16 @@ func logSummary(log *logrus.Logger, s rebalance.Summary, o options) {
 	if n := s.Skipped[rebalance.SkipHardlinked]; n > 0 {
 		log.Infof("To include the %s with hardlinks, add --process-hardlinks.", countFiles(n))
 	}
-	if n := s.Skipped[rebalance.SkipOwner]; n > 0 {
-		log.Infof("To include the %s owned by other users, run as root (with sudo).", countFiles(n))
+	// Without root, files of other users, or in folders the user can't change, are skipped before
+	// anything is read. A run with sudo keeps its progress in root's own state folder, so it can't
+	// carry on from this run's progress.
+	owned, refused := s.Skipped[rebalance.SkipOwner], s.Skipped[rebalance.SkipNoPermission]
+	if n := owned + refused; n > 0 && !isRoot() {
+		which := "owned by other users"
+		if refused > 0 {
+			which = "you don't have permission to change"
+		}
+		log.Infof("To include the %s %s, run it again with sudo (that run starts from the beginning).", countFiles(n), which)
 	}
 }
 
@@ -131,8 +143,8 @@ func rebalancedText(s rebalance.Summary) string {
 	return text
 }
 
-// skippedText is "Skipped 34 files: 20 already done, 14 hardlinked.", most common reason first,
-// or "" if nothing was skipped.
+// skippedText is "Skipped 35 files: 20 already done, 14 hardlinked, 1 leftover .balance file.",
+// most common reason first, or "" if nothing was skipped.
 func skippedText(skipped map[rebalance.SkipReason]int) string {
 	type reason struct {
 		why rebalance.SkipReason
@@ -154,7 +166,7 @@ func skippedText(skipped map[rebalance.SkipReason]int) string {
 	})
 	parts := make([]string, len(reasons))
 	for i, r := range reasons {
-		parts[i] = thousands(r.n) + " " + string(r.why)
+		parts[i] = r.why.Phrase(r.n)
 	}
 	return fmt.Sprintf("Skipped %s: %s.", countFiles(total), strings.Join(parts, ", "))
 }

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/astundzia/go-zfs-rebalance/v2/internal/fileutil"
 )
@@ -134,7 +135,7 @@ func parseArgs(args []string) (options, error) {
 	var paths []string
 	for rest := args; len(rest) > 0; {
 		if err := fs.Parse(rest); err != nil {
-			return o, friendlyFlagError(err)
+			return o, friendlyFlagError(err, rest)
 		}
 		left := fs.Args()
 		if endedWithTerminator(rest[:len(rest)-len(left)]) {
@@ -179,25 +180,63 @@ func endedWithTerminator(consumed []string) bool {
 	return probe.Parse(consumed[:n-1]) == nil && probe.NArg() == 0
 }
 
-// friendlyFlagError rewords the flag package's two most common errors. They have no types to
-// check, so their stable wording is matched instead.
-func friendlyFlagError(err error) error {
+// friendlyFlagError rewords the flag package's two most common errors, naming the option as it was
+// typed in args. They have no types to check, so their stable wording is matched instead.
+func friendlyFlagError(err error, args []string) error {
 	msg := err.Error()
-	if name, ok := strings.CutPrefix(msg, "flag provided but not defined: "); ok {
-		return fmt.Errorf("there's no option called %s", longName(name))
+	if name, ok := strings.CutPrefix(msg, "flag provided but not defined: -"); ok {
+		typed, whole := findOption(name, args)
+		if looksLikeFolder(whole) {
+			return fmt.Errorf("there's no option called %s. If that's the folder to rebalance, put -- before it, like this: rebalance -- %s",
+				typed, shellQuote(whole))
+		}
+		return fmt.Errorf("there's no option called %s", typed)
 	}
-	if name, ok := strings.CutPrefix(msg, "flag needs an argument: "); ok {
-		return fmt.Errorf("%s needs a value after it", longName(name))
+	if name, ok := strings.CutPrefix(msg, "flag needs an argument: -"); ok {
+		typed, _ := findOption(name, args)
+		return fmt.Errorf("%s needs a value after it", typed)
 	}
 	return err
 }
 
-// longName turns the flag package's "-name" into "--name", as the help shows it.
-func longName(flagName string) string {
-	if len(flagName) > 2 && !strings.HasPrefix(flagName, "--") {
-		return "-" + flagName
+// findOption finds the argument the flag package called name: the flag package drops the dashes
+// in front and anything after an "=". It returns the option as it was typed, without any "=value",
+// and the whole argument. If no argument matches, both are "--" + name, as the help shows it.
+func findOption(name string, args []string) (typed, whole string) {
+	for _, arg := range args {
+		if arg == "--" {
+			break
+		}
+		bare := strings.TrimPrefix(strings.TrimPrefix(arg, "-"), "-")
+		if bare == arg {
+			continue
+		}
+		if before, _, _ := strings.Cut(bare, "="); before == name {
+			return arg[:len(arg)-len(bare)] + name, arg
+		}
 	}
-	return flagName
+	return "--" + name, "--" + name
+}
+
+// looksLikeFolder reports whether arg, which starts with "-", is more likely a folder name than a
+// mistyped option: it has a space or slash in it, or there is something by that name here.
+func looksLikeFolder(arg string) bool {
+	if strings.ContainsAny(arg, "/ \t") {
+		return true
+	}
+	_, err := os.Lstat(arg)
+	return err == nil
+}
+
+// shellQuote quotes s for a POSIX shell when it needs it.
+func shellQuote(s string) string {
+	safe := func(r rune) bool {
+		return r < utf8.RuneSelf && (r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("-_./,:+=@%", r))
+	}
+	if s != "" && strings.IndexFunc(s, func(r rune) bool { return !safe(r) }) < 0 {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // validate checks option values that can be wrong even when they parse.

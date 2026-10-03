@@ -118,6 +118,17 @@ func TestParseZpoolListFixtures(t *testing.T) {
 			spread: 0,
 		},
 		{
+			// Captured from TrueNAS SCALE 25.10.7 (OpenZFS 2.3.9): pool built by
+			// the middleware, so leaf disks are partition UUIDs.
+			file: "real_v239_truenas.txt",
+			pool: "tank",
+			vdevs: []Vdev{
+				{Name: "mirror-0", Class: ClassData, Size: 10200547328, Alloc: 5226000384, Free: 4974546944},
+				{Name: "mirror-1", Class: ClassData, Size: 10200547328, Alloc: 139264, Free: 10200408064},
+			},
+			spread: 51.23,
+		},
+		{
 			// Live OpenZFS 2.2.2 capture: space-padded class headers (even
 			// with -H), a single-disk log vdev and a "spare" header.
 			file: "real_v222_classes.txt",

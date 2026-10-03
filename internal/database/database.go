@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"io/fs"
 	"net/url"
 	"os"
+	"os/user"
 	"path/filepath"
 	"time"
 
@@ -25,6 +27,13 @@ const (
 	appDirName    = "go-zfs-rebalance"
 	lockFileName  = "run.lock"
 	schemaVersion = "1"
+
+	// applicationID marks a SQLite file as one of our state files ("ZRBL"). SQLite keeps it in
+	// the file's header, so it can be checked without opening the database, even when the file
+	// is damaged or locked by another program.
+	applicationID = 0x5A52424C
+	// appIDOffset is where SQLite keeps the application ID: 4 bytes, big-endian.
+	appIDOffset = 68
 )
 
 var (
@@ -40,6 +49,23 @@ var (
 
 	// errDamaged marks a state file that is ours but can't be read.
 	errDamaged = errors.New("unreadable progress file")
+
+	// errInUse marks a state file that another program has locked.
+	errInUse = errors.New("progress file in use")
+)
+
+// SQLite result codes that mean another connection holds a lock on the file.
+const (
+	sqliteBusy   = 5
+	sqliteLocked = 6
+)
+
+// Test seams: who the process runs as, where root's home folder is, and how
+// long SQLite waits for another connection's lock before giving up.
+var (
+	geteuid     = os.Geteuid
+	rootHome    = lookupRootHome
+	busyTimeout = 5 * time.Second
 )
 
 // sqliteMagic is the header every SQLite 3 database file starts with.
@@ -51,11 +77,15 @@ var sidecarSuffixes = []string{"-wal", "-shm", "-journal"}
 // DefaultDir returns the folder that holds state files and the run lock:
 // $XDG_STATE_HOME/go-zfs-rebalance, or ~/.local/state/go-zfs-rebalance when
 // XDG_STATE_HOME is unset. The folder is created (mode 0700) if needed.
+//
+// When running as root, ~ is root's own home folder from the user database,
+// not $HOME: sudo on macOS keeps the user's HOME, and root-owned folders made
+// there would get in the way of the user's own programs.
 func DefaultDir() (string, error) {
 	base := os.Getenv("XDG_STATE_HOME")
 	// The XDG spec says relative values must be ignored.
 	if !filepath.IsAbs(base) {
-		home, err := os.UserHomeDir()
+		home, err := homeDir()
 		if err != nil {
 			return "", fmt.Errorf("couldn't find your home folder to keep progress in (use --db to choose a file): %w", err)
 		}
@@ -66,6 +96,29 @@ func DefaultDir() (string, error) {
 		return "", fmt.Errorf("couldn't create the folder %q to keep progress in: %w", dir, err)
 	}
 	return dir, nil
+}
+
+// homeDir is the home folder of the user the process runs as.
+func homeDir() (string, error) {
+	if geteuid() == 0 {
+		if home, err := rootHome(); err == nil {
+			return home, nil
+		}
+	}
+	return os.UserHomeDir()
+}
+
+// lookupRootHome returns root's home folder from the user database, such as
+// /root on Linux or /var/root on macOS.
+func lookupRootHome() (string, error) {
+	u, err := user.LookupId("0")
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(u.HomeDir) {
+		return "", fmt.Errorf("root's home folder %q isn't a full path", u.HomeDir)
+	}
+	return u.HomeDir, nil
 }
 
 // DefaultPath returns the state file for root inside DefaultDir. The name is
@@ -82,10 +135,11 @@ func DefaultPath(root string) (string, error) {
 
 // OpenInfo describes what Open found on disk.
 type OpenInfo struct {
-	Resumed          bool // existing state was reused
-	Discarded        bool // existing state file was deleted because resume=false
-	PreviousEntries  int  // rows in the discarded/resumed DB
-	MissingForResume bool // resume requested but no state file existed (started fresh)
+	Resumed          bool   // existing state was reused
+	Discarded        bool   // existing state file was deleted because resume=false
+	PreviousEntries  int    // rows in the discarded/resumed DB
+	PreviousRoot     string // the folder the discarded state was for, when it wasn't this one
+	MissingForResume bool   // resume requested but no state file existed (started fresh)
 }
 
 // DB is an open state file. It is safe for concurrent use.
@@ -101,7 +155,11 @@ type DB struct {
 // deleted and a fresh file is created. With resume=true an existing file is
 // reused, provided it was made for the same root; otherwise ErrRootMismatch is
 // returned. A missing file on resume starts fresh and sets MissingForResume.
-// A file that isn't one of our state files is never deleted or changed.
+//
+// Only a file that is positively one of our state files (by the application
+// ID in its header) is ever reused or deleted. Anything else, an empty file,
+// one of ours that can't be read, or one another program has locked, is left
+// alone and Open returns an error saying what to do.
 func Open(path, root string, resume bool) (*DB, OpenInfo, error) {
 	if !filepath.IsAbs(root) {
 		return nil, OpenInfo{}, fmt.Errorf("database: root %q must be an absolute path", root)
@@ -117,38 +175,39 @@ func Open(path, root string, resume bool) (*DB, OpenInfo, error) {
 
 	var info OpenInfo
 	saved, err := inspect(abs)
-	damaged := errors.Is(err, errDamaged)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		info.MissingForResume = resume
 	case errors.Is(err, errForeign):
-		return nil, OpenInfo{}, fmt.Errorf("%q doesn't look like a rebalance progress file, so it was left alone. Choose a different --db file", abs)
-	case err != nil && !damaged:
+		return nil, OpenInfo{}, fmt.Errorf("%q isn't a rebalance progress file, so it was left alone. Choose a different --db file", abs)
+	case errors.Is(err, errInUse):
+		return nil, OpenInfo{}, fmt.Errorf("the progress file %q is being used by another program right now, so it was left alone. Close that program and try again, or choose a different --db file", abs)
+	case errors.Is(err, errDamaged):
+		return nil, OpenInfo{}, fmt.Errorf("couldn't read the saved progress in %q (%s), so it was left alone. It may be damaged. If you don't need it, delete it yourself (with any -wal or -shm file next to it), or choose a different --db file", abs, reasonOf(err))
+	case err != nil:
 		return nil, OpenInfo{}, fmt.Errorf("couldn't check the progress file %q: %w", abs, err)
-	case damaged && resume:
-		return nil, OpenInfo{}, fmt.Errorf("couldn't read the saved progress in %q, it may be damaged. Run again without --resume to start fresh (%w)", abs, err)
-	case resume && saved.empty:
-		info.MissingForResume = true
-	case resume && saved.root != root:
+	case !resume:
+		info.Discarded = true
+		info.PreviousEntries = saved.entries
+		if saved.root != root {
+			info.PreviousRoot = saved.root
+		}
+	case saved.root != root:
 		return nil, OpenInfo{}, fmt.Errorf("%w: %q holds progress for %q, but this run is for %q. Run without --resume to start fresh, or choose a different --db file",
 			ErrRootMismatch, abs, saved.root, root)
-	case resume && saved.version != schemaVersion:
+	case saved.version != schemaVersion:
 		return nil, OpenInfo{}, fmt.Errorf("the saved progress in %q was made by a different version of rebalance. Run again without --resume to start fresh", abs)
-	case resume:
-		info.Resumed = true
-		info.PreviousEntries = saved.entries
 	default:
-		// A damaged file can't be counted, but it is still ours to replace.
-		info.Discarded = true
+		info.Resumed = true
 		info.PreviousEntries = saved.entries
 	}
 
 	if !info.Resumed {
-		if err := createFresh(abs); err != nil {
+		if err := createFresh(abs, root); err != nil {
 			return nil, OpenInfo{}, err
 		}
 	}
-	db, err := openRW(abs, root)
+	db, err := openRW(abs)
 	if err != nil {
 		return nil, OpenInfo{}, err
 	}
@@ -207,13 +266,12 @@ type savedState struct {
 	root    string
 	version string
 	entries int
-	empty   bool // the file exists but nothing was ever saved in it
 }
 
 // inspect reads an existing file without changing it. It returns an error
-// wrapping fs.ErrNotExist when there is no file, errForeign when the file is
-// clearly not one of ours, and errDamaged when it is an SQLite database that
-// can't be read.
+// wrapping fs.ErrNotExist when there is no file, errForeign when the file isn't
+// one of ours, errInUse when another program has it locked, and errDamaged when
+// it is one of ours but can't be read.
 func inspect(path string) (savedState, error) {
 	fi, err := os.Lstat(path)
 	if err != nil {
@@ -222,44 +280,53 @@ func inspect(path string) (savedState, error) {
 	if !fi.Mode().IsRegular() {
 		return savedState{}, errForeign
 	}
-	if fi.Size() == 0 {
-		return savedState{empty: true}, nil
-	}
-	if ok, err := hasSQLiteHeader(path); err != nil {
+	if ours, err := hasOurHeader(path); err != nil {
 		return savedState{}, err
-	} else if !ok {
+	} else if !ours {
 		return savedState{}, errForeign
 	}
 	s, err := readState(path)
-	if err != nil && !errors.Is(err, errForeign) {
-		return savedState{}, fmt.Errorf("%w: %w", errDamaged, err)
+	var coded interface{ Code() int }
+	switch {
+	case err == nil:
+		return s, nil
+	case errors.As(err, &coded) && (coded.Code()&0xff == sqliteBusy || coded.Code()&0xff == sqliteLocked):
+		return savedState{}, &unreadableError{kind: errInUse, err: err}
 	}
-	return s, err
+	return savedState{}, &unreadableError{kind: errDamaged, err: err}
 }
 
+// unreadableError is one of our state files that couldn't be read. It matches
+// its kind (errDamaged or errInUse) with errors.Is.
+type unreadableError struct {
+	kind error
+	err  error // what went wrong, as SQLite reported it
+}
+
+func (e *unreadableError) Error() string        { return e.kind.Error() + ": " + e.err.Error() }
+func (e *unreadableError) Is(target error) bool { return target == e.kind }
+func (e *unreadableError) Unwrap() error        { return e.err }
+
 // readState reads the recorded root, schema version and row count. It opens
-// the file read-only and without our pragmas, so a database that isn't ours
-// is never changed (for example, switched to WAL mode).
+// the file read-only and without our pragmas, so the file is never changed.
 func readState(path string) (savedState, error) {
 	conn, err := sql.Open(driverName, dsn(path, url.Values{
 		"mode":    {"ro"},
-		"_pragma": {"busy_timeout(5000)"},
+		"_pragma": {busyPragma()},
 	}))
 	if err != nil {
 		return savedState{}, err
 	}
 	defer conn.Close()
 
-	var tables, ours int
-	err = conn.QueryRow(`SELECT count(*), coalesce(sum(name IN ('meta', 'rebalances')), 0)
-		FROM sqlite_master WHERE type = 'table'`).Scan(&tables, &ours)
+	var ours int
+	err = conn.QueryRow(`SELECT count(*) FROM sqlite_master
+		WHERE type = 'table' AND name IN ('meta', 'rebalances')`).Scan(&ours)
 	switch {
 	case err != nil:
 		return savedState{}, err
-	case tables == 0:
-		return savedState{empty: true}, nil
 	case ours != 2:
-		return savedState{}, errForeign
+		return savedState{}, errors.New("its tables are missing")
 	}
 
 	var s savedState
@@ -291,29 +358,32 @@ func readState(path string) (savedState, error) {
 	return s, nil
 }
 
-// hasSQLiteHeader reports whether path starts with the SQLite 3 file header.
-func hasSQLiteHeader(path string) (bool, error) {
+// hasOurHeader reports whether path starts with the SQLite 3 file header and
+// carries our application ID.
+func hasOurHeader(path string) (bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return false, err
 	}
 	defer f.Close()
-	header := make([]byte, len(sqliteMagic))
+	header := make([]byte, appIDOffset+4)
 	if _, err := io.ReadFull(f, header); err != nil {
-		if errors.Is(err, io.ErrUnexpectedEOF) {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 			return false, nil
 		}
 		return false, err
 	}
-	return bytes.Equal(header, sqliteMagic), nil
+	return bytes.HasPrefix(header, sqliteMagic) &&
+		binary.BigEndian.Uint32(header[appIDOffset:]) == applicationID, nil
 }
 
-// createFresh deletes any old state file and its sidecars, then creates an
-// empty, private (0600) file. Sidecars go first, so a failed removal never
-// leaves an old -wal or -journal beside a new database.
-func createFresh(path string) error {
+// createFresh replaces any old state file and its sidecars with a new, empty
+// one for root. The new file is set up under a temporary name and renamed into
+// place, so path never holds a half-made file that wouldn't be recognised as
+// ours. Old sidecars go first, so an old -wal is never applied to the new file.
+func createFresh(path, root string) error {
 	var errs []error
-	for _, name := range append(sidecarFiles(path), path) {
+	for _, name := range sidecarFiles(path) {
 		if err := os.Remove(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			errs = append(errs, err)
 		}
@@ -321,14 +391,55 @@ func createFresh(path string) error {
 	if err := errors.Join(errs...); err != nil {
 		return fmt.Errorf("couldn't remove the old progress file %q: %w", path, err)
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".new-*")
 	if err != nil {
 		return fmt.Errorf("couldn't create the progress file %q: %w", path, err)
 	}
-	if err := f.Close(); err != nil {
+	tmp := f.Name()
+	err = errors.Join(f.Close(), initFile(tmp, root), os.Rename(tmp, path))
+	if err != nil {
+		for _, name := range append(sidecarFiles(tmp), tmp) {
+			_ = os.Remove(name)
+		}
 		return fmt.Errorf("couldn't create the progress file %q: %w", path, err)
 	}
 	return nil
+}
+
+// initFile writes our schema, root and application ID into the empty file at
+// path. It uses SQLite's default rollback journal, so everything lands in the
+// file itself, never only in a -wal file beside it; openRW switches the file to
+// WAL mode afterwards.
+func initFile(path, root string) error {
+	conn, err := sql.Open(driverName, dsn(path, url.Values{"_pragma": {busyPragma()}}))
+	if err != nil {
+		return err
+	}
+	conn.SetMaxOpenConns(1)
+	defer conn.Close()
+
+	tx, err := conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, stmt := range []string{
+		`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)`,
+		`CREATE TABLE rebalances (path TEXT PRIMARY KEY, count INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+		fmt.Sprintf(`PRAGMA application_id = %d`, applicationID),
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(`INSERT INTO meta (key, value) VALUES ('root', ?), ('schema_version', ?)`, root, schemaVersion); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return conn.Close()
 }
 
 func sidecarFiles(path string) []string {
@@ -339,11 +450,10 @@ func sidecarFiles(path string) []string {
 	return files
 }
 
-// openRW opens path for writing, makes sure the schema exists and records root
-// if the file is new.
-func openRW(path, root string) (*DB, error) {
+// openRW opens one of our state files for writing.
+func openRW(path string) (*DB, error) {
 	conn, err := sql.Open(driverName, dsn(path, url.Values{
-		"_pragma": {"busy_timeout(5000)", "journal_mode(WAL)", "synchronous(NORMAL)"},
+		"_pragma": {busyPragma(), "journal_mode(WAL)", "synchronous(NORMAL)"},
 	}))
 	if err != nil {
 		return nil, fmt.Errorf("couldn't open the progress file %q: %w", path, err)
@@ -353,39 +463,26 @@ func openRW(path, root string) (*DB, error) {
 	conn.SetMaxOpenConns(1)
 
 	db := &DB{conn: conn, path: path}
-	if err := db.init(root); err != nil {
+	db.inc, err = conn.Prepare(`INSERT INTO rebalances (path, count, updated_at) VALUES (?1, 1, ?2)
+		ON CONFLICT (path) DO UPDATE SET count = count + 1, updated_at = excluded.updated_at
+		RETURNING count`)
+	if err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("couldn't set up the progress file %q: %w", path, err)
 	}
 	return db, nil
 }
 
-func (db *DB) init(root string) error {
-	tx, err := db.conn.Begin()
-	if err != nil {
-		return err
+// reasonOf is the text of the innermost error, such as "file is not a
+// database (26)".
+func reasonOf(err error) string {
+	for next := errors.Unwrap(err); next != nil; next = errors.Unwrap(err) {
+		err = next
 	}
-	defer func() { _ = tx.Rollback() }()
-	for _, stmt := range []string{
-		`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)`,
-		`CREATE TABLE IF NOT EXISTS rebalances (path TEXT PRIMARY KEY, count INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
-	} {
-		if _, err := tx.Exec(stmt); err != nil {
-			return err
-		}
-	}
-	if _, err := tx.Exec(`INSERT INTO meta (key, value) VALUES ('root', ?), ('schema_version', ?)
-		ON CONFLICT (key) DO NOTHING`, root, schemaVersion); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	db.inc, err = db.conn.Prepare(`INSERT INTO rebalances (path, count, updated_at) VALUES (?1, 1, ?2)
-		ON CONFLICT (path) DO UPDATE SET count = count + 1, updated_at = excluded.updated_at
-		RETURNING count`)
-	return err
+	return err.Error()
 }
+
+func busyPragma() string { return fmt.Sprintf("busy_timeout(%d)", busyTimeout.Milliseconds()) }
 
 // dsn builds a file: URI so paths containing '?', '#' or '%' are passed to
 // SQLite intact.

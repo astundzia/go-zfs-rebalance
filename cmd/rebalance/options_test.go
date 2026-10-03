@@ -114,7 +114,14 @@ func TestParseArgsErrors(t *testing.T) {
 		{"negative size threshold", []string{"--size-threshold", "-1", "/a"}, "--size-threshold can't be negative"},
 		{"negative concurrency", []string{"--concurrency", "-1", "/a"}, "--concurrency can't be negative"},
 		{"unknown option", []string{"--frobnicate", "/a"}, "there's no option called --frobnicate"},
+		{"unknown option typed with one dash", []string{"-frobnicate", "/a"}, "there's no option called -frobnicate"},
+		{"unknown option with a value", []string{"/a", "--frobnicate=3"}, "there's no option called --frobnicate"},
+		{"a folder starting with a dash", []string{"-dash dir"},
+			"there's no option called -dash dir. If that's the folder to rebalance, put -- before it, like this: rebalance -- '-dash dir'"},
+		{"a path starting with a dash", []string{"-tank/media"},
+			"there's no option called -tank/media. If that's the folder to rebalance, put -- before it, like this: rebalance -- -tank/media"},
 		{"missing value", []string{"/a", "--db"}, "--db needs a value after it"},
+		{"missing value, one dash", []string{"/a", "-db"}, "-db needs a value after it"},
 		{"bad syntax", []string{"---x", "/a"}, "bad flag syntax"},
 	}
 	for _, tt := range tests {
@@ -127,6 +134,43 @@ func TestParseArgsErrors(t *testing.T) {
 	}
 	if _, err := parseArgs(nil); err != errNoArgs {
 		t.Errorf("parseArgs(nil) = %v, want errNoArgs", err)
+	}
+}
+
+// TestDashFolderHint checks that the hint to put -- before a folder is given only for an argument
+// that looks like one.
+func TestDashFolderHint(t *testing.T) {
+	t.Chdir(tempDir(t))
+	if err := os.Mkdir("-photos", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := parseArgs([]string{"--no-random", "-photos"})
+	if err == nil || !strings.HasSuffix(err.Error(), "put -- before it, like this: rebalance -- -photos") {
+		t.Errorf("an existing folder: %v", err)
+	}
+	_, err = parseArgs([]string{"-nope", "/a"})
+	if err == nil || strings.Contains(err.Error(), "put --") {
+		t.Errorf("a mistyped option got the folder hint: %v", err)
+	}
+	// Once -- has been given, nothing after it is an option.
+	if o, err := parseArgs([]string{"--", "-photos"}); err != nil || o.path != "-photos" {
+		t.Errorf("parseArgs(-- -photos) = %+v, %v", o, err)
+	}
+}
+
+func TestShellQuote(t *testing.T) {
+	for in, want := range map[string]string{
+		"-photos":          "-photos",
+		"-tank/media_2024": "-tank/media_2024",
+		"-dash dir":        "'-dash dir'",
+		"-it's":            `'-it'\''s'`,
+		"-$HOME":           "'-$HOME'",
+		"-日本":              "'-日本'",
+		"":                 "''",
+	} {
+		if got := shellQuote(in); got != want {
+			t.Errorf("shellQuote(%q) = %s, want %s", in, got, want)
+		}
 	}
 }
 

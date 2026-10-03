@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 const testRoot = "/tank/media"
@@ -66,6 +68,24 @@ func requireMode(t *testing.T, path string, want os.FileMode) {
 	}
 }
 
+// requireOurHeader fails unless path's own header (not a -wal file) marks it
+// as one of our state files.
+func requireOurHeader(t *testing.T, path string) {
+	t.Helper()
+	ours, err := hasOurHeader(path)
+	if err != nil || !ours {
+		t.Errorf("%s doesn't carry our application ID in its header (err = %v)", path, err)
+	}
+}
+
+// ourDamagedFile is a file whose header says it's one of ours but whose
+// contents SQLite can't read.
+func ourDamagedFile() []byte {
+	b := append(slices.Clone(sqliteMagic), bytes.Repeat([]byte{0xff}, 4096)...)
+	binary.BigEndian.PutUint32(b[appIDOffset:], applicationID)
+	return b
+}
+
 func requireMissing(t *testing.T, path string) {
 	t.Helper()
 	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
@@ -115,6 +135,14 @@ func TestOpenFreshCreatesSchema(t *testing.T) {
 	}
 	if mode != "wal" {
 		t.Errorf("journal_mode = %q, want wal", mode)
+	}
+	var id int64
+	if err := db.conn.QueryRow(`PRAGMA application_id`).Scan(&id); err != nil || id != applicationID {
+		t.Errorf("application_id = %#x, %v; want %#x", id, err, applicationID)
+	}
+	requireOurHeader(t, path)
+	if leftovers, _ := filepath.Glob(filepath.Join(dir, ".x.db.new-*")); len(leftovers) > 0 {
+		t.Errorf("temporary files left behind: %v", leftovers)
 	}
 }
 
@@ -280,6 +308,10 @@ func TestFreshDiscardsCrashLeftovers(t *testing.T) {
 	mustIncrement(t, db, "a", 1)
 	mustIncrement(t, db, "b", 2)
 	mustIncrement(t, db, "c", 1)
+	// The file itself must already say it's ours, even though the progress is
+	// still only in the -wal file: a run killed now must not leave a file the
+	// next run refuses to touch.
+	requireOurHeader(t, live)
 	for _, suffix := range []string{"", "-wal", "-shm"} {
 		data, err := os.ReadFile(live + suffix)
 		if err != nil {
@@ -323,21 +355,48 @@ func TestCreateFreshRemovesOldFiles(t *testing.T) {
 		}
 	}
 
-	if err := createFresh(path); err != nil {
+	if err := createFresh(path, testRoot); err != nil {
 		t.Fatal(err)
 	}
 
 	for _, name := range sidecarFiles(path) {
 		requireMissing(t, name)
 	}
-	fi, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if fi.Size() != 0 {
-		t.Errorf("new state file has %d bytes, want 0", fi.Size())
-	}
 	requireMode(t, path, 0o600)
+	requireOurHeader(t, path)
+	saved, err := readState(path)
+	if err != nil || saved != (savedState{root: testRoot, version: schemaVersion}) {
+		t.Errorf("readState = %+v, %v; want an empty state for %s", saved, err, testRoot)
+	}
+	if leftovers, _ := filepath.Glob(filepath.Join(filepath.Dir(path), ".x.db.new-*")); len(leftovers) > 0 {
+		t.Errorf("temporary files left behind: %v", leftovers)
+	}
+}
+
+// TestResumeAfterCrash resumes from a copy of a live database (main file plus
+// its -wal and -shm), as left by a run that was killed.
+func TestResumeAfterCrash(t *testing.T) {
+	dir := t.TempDir()
+	live := filepath.Join(dir, "live.db")
+	crashed := filepath.Join(dir, "crashed.db")
+	db, _ := mustOpen(t, live, testRoot, false)
+	mustIncrement(t, db, "a", 2)
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		data, err := os.ReadFile(live + suffix)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(crashed+suffix, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	resumed, info := mustOpen(t, crashed, testRoot, true)
+
+	if want := (OpenInfo{Resumed: true, PreviousEntries: 1}); info != want {
+		t.Errorf("info = %+v, want %+v", info, want)
+	}
+	requireCounts(t, resumed, map[string]int{"a": 2})
 }
 
 func TestFreshDiscardsClosedState(t *testing.T) {
@@ -352,8 +411,7 @@ func TestFreshDiscardsClosedState(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A fresh run may also be for a different folder.
-	db2, info := mustOpen(t, path, "/tank/other", false)
+	db2, info := mustOpen(t, path, testRoot, false)
 
 	if want := (OpenInfo{Discarded: true, PreviousEntries: 2}); info != want {
 		t.Errorf("info = %+v, want %+v", info, want)
@@ -361,20 +419,94 @@ func TestFreshDiscardsClosedState(t *testing.T) {
 	requireCounts(t, db2, map[string]int{})
 }
 
-func TestFreshDiscardsDamagedState(t *testing.T) {
+// TestFreshForAnotherFolderSaysWhichFolder checks that a fresh run reusing a
+// --db file made for another folder says whose progress it replaced.
+func TestFreshForAnotherFolderSaysWhichFolder(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "x.db")
-	damaged := append(slices.Clone(sqliteMagic), bytes.Repeat([]byte{0xff}, 4096)...)
-	if err := os.WriteFile(path, damaged, 0o600); err != nil {
+	db, _, err := Open(path, "/tank/a", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustIncrement(t, db, "f", 1)
+	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	db, info := mustOpen(t, path, testRoot, false)
+	db2, info := mustOpen(t, path, "/tank/b", false)
 
-	if want := (OpenInfo{Discarded: true}); info != want {
+	if want := (OpenInfo{Discarded: true, PreviousEntries: 1, PreviousRoot: "/tank/a"}); info != want {
 		t.Errorf("info = %+v, want %+v", info, want)
 	}
+	requireCounts(t, db2, map[string]int{})
+}
+
+// TestDamagedStateIsLeftAlone checks that one of our files that SQLite can't
+// read is never deleted: the user is told to delete it themselves.
+func TestDamagedStateIsLeftAlone(t *testing.T) {
+	for _, resume := range []bool{false, true} {
+		t.Run(fmt.Sprintf("resume=%v", resume), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "x.db")
+			damaged := ourDamagedFile()
+			if err := os.WriteFile(path, damaged, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			_, _, err := Open(path, testRoot, resume)
+
+			for _, want := range []string{"couldn't read the saved progress in " + fmt.Sprintf("%q", path), "left alone", "delete it yourself"} {
+				if err == nil || !strings.Contains(err.Error(), want) {
+					t.Errorf("err = %v, want it to contain %q", err, want)
+				}
+			}
+			if got, _ := os.ReadFile(path); !bytes.Equal(got, damaged) {
+				t.Error("the damaged file was changed")
+			}
+			requireMissing(t, path+"-wal")
+		})
+	}
+}
+
+// TestStateInUseIsLeftAlone checks that a state file another program holds an
+// exclusive lock on is reported as in use, not as damaged, and isn't touched.
+func TestStateInUseIsLeftAlone(t *testing.T) {
+	busyTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { busyTimeout = 5 * time.Second })
+	path := filepath.Join(t.TempDir(), "x.db")
+	db, _, err := Open(path, testRoot, false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	mustIncrement(t, db, "a", 1)
-	requireCounts(t, db, map[string]int{"a": 1})
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := sql.Open(driverName, dsn(path, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	holder.SetMaxOpenConns(1)
+	if _, err := holder.Exec(`PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE`); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, resume := range []bool{false, true} {
+		_, _, err = Open(path, testRoot, resume)
+		if err == nil || !strings.Contains(err.Error(), "is being used by another program right now, so it was left alone") {
+			t.Errorf("resume=%v: err = %v, want an in-use refusal", resume, err)
+		}
+	}
+	if _, err := holder.Exec(`COMMIT`); err != nil {
+		t.Fatal(err)
+	}
+	if err := holder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db2, info := mustOpen(t, path, testRoot, true)
+	if !info.Resumed {
+		t.Errorf("info = %+v, want Resumed", info)
+	}
+	requireCounts(t, db2, map[string]int{"a": 1})
 }
 
 func TestResumeMissingFileStartsFresh(t *testing.T) {
@@ -387,20 +519,6 @@ func TestResumeMissingFileStartsFresh(t *testing.T) {
 	}
 	mustIncrement(t, db, "a", 1)
 	requireCounts(t, db, map[string]int{"a": 1})
-}
-
-func TestResumeEmptyFileStartsFresh(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "empty.db")
-	if err := os.WriteFile(path, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	db, info := mustOpen(t, path, testRoot, true)
-
-	if want := (OpenInfo{MissingForResume: true}); info != want {
-		t.Errorf("info = %+v, want %+v", info, want)
-	}
-	requireCounts(t, db, map[string]int{})
 }
 
 func TestResumeRootMismatch(t *testing.T) {
@@ -430,23 +548,6 @@ func TestResumeRootMismatch(t *testing.T) {
 		t.Errorf("info = %+v, want Resumed", info)
 	}
 	requireCounts(t, db2, map[string]int{"f": 1})
-}
-
-func TestResumeDamagedFileSuggestsFreshStart(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "x.db")
-	damaged := append(slices.Clone(sqliteMagic), bytes.Repeat([]byte{0xff}, 4096)...)
-	if err := os.WriteFile(path, damaged, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	_, _, err := Open(path, testRoot, true)
-
-	if err == nil || !strings.Contains(err.Error(), "without --resume") {
-		t.Fatalf("err = %v, want a hint to run without --resume", err)
-	}
-	if got, _ := os.ReadFile(path); !bytes.Equal(got, damaged) {
-		t.Error("a failed resume must not change the state file")
-	}
 }
 
 func TestResumeOtherSchemaVersion(t *testing.T) {
@@ -496,7 +597,30 @@ func TestForeignFilesAreLeftAlone(t *testing.T) {
 				t.Fatal(err)
 			}
 		}},
+		{"empty file", func(t *testing.T, path string) {
+			if err := os.WriteFile(path, nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}},
 		{"another app's SQLite database", foreignSQLite},
+		{"another app's damaged SQLite database", func(t *testing.T, path string) {
+			damaged := append(slices.Clone(sqliteMagic), bytes.Repeat([]byte{0xff}, 4096)...)
+			if err := os.WriteFile(path, damaged, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"a database with our tables but not our ID", func(t *testing.T, path string) {
+			conn, err := sql.Open(driverName, dsn(path, nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if _, err := conn.Exec(`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+				CREATE TABLE rebalances (path TEXT PRIMARY KEY, count INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+				INSERT INTO meta VALUES ('root', '/tank/media'), ('schema_version', '1')`); err != nil {
+				t.Fatal(err)
+			}
+		}},
 	}
 	for _, tt := range tests {
 		for _, resume := range []bool{false, true} {
@@ -524,6 +648,37 @@ func TestForeignFilesAreLeftAlone(t *testing.T) {
 			})
 		}
 	}
+
+	// The case from the review: another app holds an exclusive lock on its
+	// database. It must be refused straight away, without waiting for the lock.
+	t.Run("another app's locked SQLite database", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "x.db")
+		foreignSQLite(t, path)
+		holder, err := sql.Open(driverName, dsn(path, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer holder.Close()
+		holder.SetMaxOpenConns(1)
+		if _, err := holder.Exec(`BEGIN EXCLUSIVE`); err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		_, _, err = Open(path, testRoot, false)
+		if err == nil || !strings.Contains(err.Error(), "isn't a rebalance progress file, so it was left alone") {
+			t.Fatalf("err = %v, want a refusal", err)
+		}
+		if waited := time.Since(start); waited > time.Second {
+			t.Errorf("waited %v for the other app's lock", waited)
+		}
+		if _, err := holder.Exec(`COMMIT`); err != nil {
+			t.Fatal(err)
+		}
+		var name string
+		if err := holder.QueryRow(`SELECT name FROM photos`).Scan(&name); err != nil || name != "cat.jpg" {
+			t.Errorf("the other app's data is gone: %q, %v", name, err)
+		}
+	})
 
 	t.Run("directory", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "x.db")
@@ -560,6 +715,10 @@ func TestDefaultDir(t *testing.T) {
 		{name: "XDG_STATE_HOME unset", xdg: "", wantRel: ".local/state/go-zfs-rebalance"},
 		{name: "relative XDG_STATE_HOME is ignored", xdg: "relative/state", wantRel: ".local/state/go-zfs-rebalance"},
 	}
+	// Root uses its own home folder (see TestDefaultDirAsRoot).
+	oldEUID := geteuid
+	t.Cleanup(func() { geteuid = oldEUID })
+	geteuid = func() int { return 1000 }
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			home := t.TempDir()
@@ -582,6 +741,54 @@ func TestDefaultDir(t *testing.T) {
 			requireMode(t, got, 0o700)
 		})
 	}
+}
+
+// TestDefaultDirAsRoot checks that a run as root keeps its state in root's
+// own home folder, not in the $HOME that sudo on macOS leaves pointing at the
+// user's home.
+func TestDefaultDirAsRoot(t *testing.T) {
+	userHome, rootsHome, xdg := t.TempDir(), t.TempDir(), t.TempDir()
+	t.Setenv("HOME", userHome)
+	oldEUID, oldHome := geteuid, rootHome
+	t.Cleanup(func() { geteuid, rootHome = oldEUID, oldHome })
+	geteuid = func() int { return 0 }
+	rootHome = func() (string, error) { return rootsHome, nil }
+
+	t.Setenv("XDG_STATE_HOME", "")
+	got, err := DefaultDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(rootsHome, ".local/state/go-zfs-rebalance"); got != want {
+		t.Errorf("DefaultDir() = %q, want %q", got, want)
+	}
+	if entries, _ := os.ReadDir(userHome); len(entries) > 0 {
+		t.Errorf("something was created in the user's home: %v", entries)
+	}
+
+	// XDG_STATE_HOME still wins, as it does for everyone.
+	t.Setenv("XDG_STATE_HOME", xdg)
+	if got, err := DefaultDir(); err != nil || got != filepath.Join(xdg, "go-zfs-rebalance") {
+		t.Errorf("with XDG_STATE_HOME: DefaultDir() = %q, %v", got, err)
+	}
+
+	// If root's home can't be found, $HOME is the fallback.
+	t.Setenv("XDG_STATE_HOME", "")
+	rootHome = func() (string, error) { return "", errors.New("no such user") }
+	if got, err := DefaultDir(); err != nil || got != filepath.Join(userHome, ".local/state/go-zfs-rebalance") {
+		t.Errorf("without root's home: DefaultDir() = %q, %v", got, err)
+	}
+}
+
+func TestLookupRootHome(t *testing.T) {
+	home, err := lookupRootHome()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(home) {
+		t.Errorf("root's home %q isn't a full path", home)
+	}
+	t.Logf("root's home is %s", home)
 }
 
 func TestDefaultPath(t *testing.T) {
