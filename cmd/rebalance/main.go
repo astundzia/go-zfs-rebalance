@@ -1,582 +1,284 @@
+// Command rebalance rewrites every file in a folder in place, so that ZFS spreads the data across
+// all the drives in the pool. Each file is copied, checked and swapped in atomically, keeping its
+// contents, owner, permissions, extended attributes, ACLs and timestamps.
+//
+// Run it with --help for the options, or see the README.
 package main
 
 import (
-	"flag"
+	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"runtime"
-	"strconv"
-	"strings"
-	"syscall"
-	"time"
 
-	"github.com/astundzia/go-zfs-rebalance/internal/database"
-	"github.com/astundzia/go-zfs-rebalance/internal/fileutil"
-	"github.com/astundzia/go-zfs-rebalance/pkg/rebalance"
+	"github.com/astundzia/go-zfs-rebalance/v2/internal/database"
+	"github.com/astundzia/go-zfs-rebalance/v2/internal/rebalance"
+	"github.com/astundzia/go-zfs-rebalance/v2/internal/zfs"
 	"github.com/sirupsen/logrus"
 )
 
-// Version information
-var (
-	VERSION = "1.0.1"
-)
+// version is set when building a release, with -ldflags "-X main.version=v2.0.0".
+var version = "dev"
 
-// ANSI color codes
+// Exit codes.
 const (
-	colorReset  = "\033[0m"
-	colorRed    = "\033[31m"
-	colorGreen  = "\033[32m"
-	colorYellow = "\033[33m"
-	colorBlue   = "\033[34m"
-	colorBold   = "\033[1m"
+	exitOK          = 0
+	exitFailed      = 1   // some files couldn't be rebalanced; each was left as it was
+	exitUsage       = 2   // bad options, unusable setup, or another run in progress; nothing was changed
+	exitHalted      = 3   // stopped early because a file went missing (--halt-on-missing) or space ran out
+	exitInterrupted = 130 // stopped by Ctrl+C or another signal
 )
 
-// CustomFormatter is a custom logrus formatter that uses a simpler timestamp format
-type CustomFormatter struct {
-	logrus.TextFormatter
-}
+// lockFileName is the run lock's name inside its folder (see database.AcquireLock). The run must
+// never rewrite it: a new inode would let a second run take the lock while this one holds it.
+const lockFileName = "run.lock"
 
-// Format implements logrus.Formatter interface
-func (f *CustomFormatter) Format(entry *logrus.Entry) ([]byte, error) {
-	// Use a timestamp format with seconds: "11:25:59 PM"
-	timestamp := entry.Time.Format("3:04:05 PM")
-
-	// Get operation type and file path from the message
-	operation := ""
-	filePath := ""
-	color := ""
-
-	// Extract speed information if available
-	speedStr := ""
-
-	// Set color based on log level
-	switch entry.Level {
-	case logrus.ErrorLevel:
-		color = colorRed
-	case logrus.WarnLevel:
-		// Only use yellow for warnings, success messages get special handling
-		if !strings.Contains(entry.Message, "Successfully rebalanced") {
-			color = colorYellow
-		}
-	}
-
-	// Check if message contains copy speed
-	if strings.Contains(entry.Message, "completed at") {
-		parts := strings.Split(entry.Message, "completed at")
-		if len(parts) > 1 {
-			speedPart := strings.TrimSpace(parts[1])
-			if strings.HasSuffix(speedPart, "MB/s") {
-				operation = "Copying"
-				speedStr = fmt.Sprintf("at %.2f MB/s", parseSpeed(speedPart))
-			}
-		}
-	} else if strings.Contains(entry.Message, "Copying '") {
-		operation = "Copying"
-
-		// Extract file path
-		parts := strings.Split(entry.Message, "Copying '")
-		if len(parts) > 1 {
-			pathParts := strings.Split(parts[1], "' to '")
-			if len(pathParts) > 0 {
-				filePath = pathParts[0]
-			}
-		}
-	} else if strings.Contains(entry.Message, "Removing original") {
-		operation = "Removing"
-
-		// Extract file path
-		parts := strings.Split(entry.Message, "Removing original '")
-		if len(parts) > 1 {
-			pathParts := strings.Split(parts[1], "'...")
-			if len(pathParts) > 0 {
-				filePath = pathParts[0]
-			}
-		}
-	} else if strings.Contains(entry.Message, "Renaming") {
-		operation = "Renaming"
-
-		// Extract filenames from the format: Renaming 'source.ext.balance' to 'dest.ext'
-		parts := strings.Split(entry.Message, "Renaming '")
-		if len(parts) > 1 {
-			pathParts := strings.Split(parts[1], "' to '")
-			if len(pathParts) > 1 {
-				sourceFile := pathParts[0]
-				destFile := strings.TrimSuffix(pathParts[1], "'")
-				// Use both source and destination in the formatted message
-				filePath = fmt.Sprintf("%s to %s", sourceFile, destFile)
-			}
-		}
-	} else if strings.Contains(entry.Message, "Failed to rebalance") {
-		operation = "Error"
-		color = colorRed
-
-		// Extract file path
-		parts := strings.Split(entry.Message, "Failed to rebalance ")
-		if len(parts) > 1 {
-			pathParts := strings.Split(parts[1], ":")
-			if len(pathParts) > 0 {
-				filePath = pathParts[0]
-			}
-		}
-	} else if strings.Contains(entry.Message, "Successfully rebalanced") {
-		operation = "Success"
-		color = colorGreen // Always green for success
-
-		// Extract file path and get just the filename
-		parts := strings.Split(entry.Message, "Successfully rebalanced ")
-		if len(parts) > 1 {
-			fullPath := parts[1]
-
-			// If path contains a speed component, remove it before extracting filename
-			if strings.Contains(fullPath, " at ") {
-				fullPath = strings.Split(fullPath, " at ")[0]
-			}
-
-			// Check if we should show full paths
-			// We need to check entry.Data for custom fields passed from rebalancer
-			showFullPathsVal, ok := entry.Data["show_full_paths"]
-			showFullPaths := false
-			if ok {
-				if boolVal, ok := showFullPathsVal.(bool); ok {
-					showFullPaths = boolVal
-				}
-			}
-
-			if showFullPaths {
-				// Use the full path directly
-				filePath = fullPath
-			} else {
-				// Extract just the filename from the full path
-				_, filePath = filepath.Split(fullPath)
-			}
-
-			// If there's a speed measurement, preserve it
-			if strings.Contains(parts[1], " at ") {
-				speedPart := strings.Split(parts[1], " at ")[1]
-				speedStr = "at " + speedPart
-			}
-		}
-	} else if strings.Contains(entry.Message, "permission") {
-		color = colorYellow
-	} else if strings.Contains(entry.Message, "File missing") ||
-		strings.Contains(entry.Message, "no longer on disk") {
-		color = colorYellow
-	}
-
-	// Construct the formatted log message
-	var msg string
-	if operation != "" && filePath != "" {
-		// Format with double quotes around filename and hyphens between elements
-		if speedStr != "" {
-			if operation == "Success" {
-				// Bold success messages
-				msg = fmt.Sprintf("%s - %s%s%s%s - \"%s\" %s\n", timestamp, color, colorBold, operation, colorReset, filePath, speedStr)
-			} else {
-				msg = fmt.Sprintf("%s - %s%s%s - \"%s\" %s\n", timestamp, color, operation, colorReset, filePath, speedStr)
-			}
-		} else {
-			if operation == "Success" {
-				// Bold success messages
-				msg = fmt.Sprintf("%s - %s%s%s%s - \"%s\"\n", timestamp, color, colorBold, operation, colorReset, filePath)
-			} else {
-				msg = fmt.Sprintf("%s - %s%s%s - \"%s\"\n", timestamp, color, operation, colorReset, filePath)
-			}
-		}
-	} else {
-		// For other messages apply any color if set, with hyphens
-		if color != "" {
-			msg = fmt.Sprintf("%s - %s%s%s\n", timestamp, color, entry.Message, colorReset)
-		} else {
-			msg = fmt.Sprintf("%s - %s\n", timestamp, entry.Message)
-		}
-	}
-
-	return []byte(msg), nil
-}
-
-// parseSpeed extracts a float speed value from a string like "110.04 MB/s"
-func parseSpeed(speedStr string) float64 {
-	speedStr = strings.TrimSuffix(strings.TrimSpace(speedStr), "MB/s")
-	speedStr = strings.TrimSpace(speedStr)
-	speed, _ := strconv.ParseFloat(speedStr, 64)
-	return speed
-}
-
-// printUsage prints a detailed help message with examples
-func printUsage() {
-	fmt.Println("go-zfs-rebalance")
-	fmt.Println("===============================")
-	fmt.Println("A tool for reducing ZFS fragmentation by copying files in-place.")
-	fmt.Println("This helps redistribute data blocks and can improve performance on fragmented pools.")
-	fmt.Println()
-	fmt.Println("Usage:")
-	fmt.Println("  rebalance [options] <path>")
-	fmt.Println()
-	fmt.Println("Options:")
-	fmt.Println("  --process-hardlinks  Process files with multiple hardlinks (skipped by default)")
-	fmt.Println("  --passes X           Number of times a file may be rebalanced (default: 10, 0 for unlimited)")
-	fmt.Println("  --concurrency X      Number of files to process concurrently (default: auto - half of CPU cores, minimum 2, maximum 128)")
-	fmt.Println("  --no-cleanup-balance Disable automatic removal of stale .balance files (enabled by default)")
-	fmt.Println("  --no-random          Process files in directory order instead of random order (default)")
-	fmt.Println("  --debug              Enable debug logging (shows all operations, not just successes/errors)")
-	fmt.Println("  --size-threshold X   Only show success messages for files >= X MB (default: 0)")
-	fmt.Println("  --checksum TYPE      Checksum type to use (sha256 or md5, default: sha256)")
-	fmt.Println("  --halt-on-missing    Halt processing when a file is no longer on disk")
-	fmt.Println("  --filename-only      Display only filenames instead of full paths in logs (full paths by default)")
-	fmt.Println("  --version            Show version information")
-	fmt.Println("  --help               Show this help message")
-	fmt.Println()
-	fmt.Println("Features:")
-	fmt.Println("  * Files are verified using SHA256 checksums (or MD5 if specified) to ensure data integrity")
-	fmt.Println("  * File attributes (permissions, timestamps, ownership) are preserved")
-	fmt.Println("  * Graceful shutdown on CTRL+C - finishes in-progress files")
-	fmt.Println()
-	fmt.Println("Examples:")
-	fmt.Println("  # Rebalance all files in a directory with default settings")
-	fmt.Println("  rebalance /path/to/data")
-	fmt.Println()
-	fmt.Println("  # Process hardlinks as well (potentially increasing space usage)")
-	fmt.Println("  rebalance --process-hardlinks --concurrency 8 /path/to/data")
-	fmt.Println()
-	fmt.Println("  # Rebalance files multiple times (useful for severely fragmented pools)")
-	fmt.Println("  rebalance --passes 3 /path/to/data")
-	fmt.Println()
-	fmt.Println("  # Disable random file processing order")
-	fmt.Println("  rebalance --no-random /path/to/data")
-	fmt.Println()
-	fmt.Println("  # Disable automatic cleanup of stale .balance files")
-	fmt.Println("  rebalance --no-cleanup-balance /path/to/data")
-	fmt.Println()
-	fmt.Println("  # Enable verbose debugging output")
-	fmt.Println("  rebalance --debug /path/to/data")
-	fmt.Println()
-	fmt.Println("  # Only show success messages for files 20MB or larger")
-	fmt.Println("  rebalance --size-threshold 20 /path/to/data")
-	fmt.Println()
-	fmt.Println("  # Halt processing when a file is found to be missing during rebalance")
-	fmt.Println("  rebalance --halt-on-missing /path/to/data")
-}
-
-// concurrencyStr returns a string representation of the concurrency setting
-func concurrencyStr(concurrency int) string {
-	if concurrency <= 0 {
-		// For auto concurrency, calculate and include the actual worker count
-		cpuCount := runtime.NumCPU()
-		autoConcurrency := cpuCount / 2
-		if autoConcurrency < 2 {
-			autoConcurrency = 2
-		}
-		return fmt.Sprintf("auto (%d workers based on %d CPUs)", autoConcurrency, cpuCount)
-	}
-	return fmt.Sprintf("%d", concurrency)
-}
-
-// calculateConcurrency determines the number of worker threads to use
-// If auto is specified (concurrency <= 0), it uses half the number of CPU cores with a minimum of 2
-func calculateConcurrency(concurrency int) int {
-	// Set a maximum concurrency to prevent resource exhaustion
-	const maxConcurrency = 128
-
-	if concurrency > 0 {
-		// Apply the maximum limit
-		if concurrency > maxConcurrency {
-			return maxConcurrency
-		}
-		return concurrency
-	}
-
-	// Auto concurrency: half the number of CPU cores, minimum 2
-	cpuCount := runtime.NumCPU()
-	autoConcurrency := cpuCount / 2
-	if autoConcurrency < 2 {
-		autoConcurrency = 2
-	}
-	// Also apply max limit to auto-calculated concurrency
-	if autoConcurrency > maxConcurrency {
-		autoConcurrency = maxConcurrency
-	}
-	return autoConcurrency
-}
+// goos is runtime.GOOS. Tests change it to check the message on unsupported systems.
+var goos = runtime.GOOS
 
 func main() {
-	// Set up the logger with our custom format
-	log := logrus.New()
-	log.Formatter = &CustomFormatter{
-		TextFormatter: logrus.TextFormatter{
-			DisableColors: false,
-			ForceColors:   true,
-		},
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+// run is the whole command. It returns the exit code rather than exiting, so that deferred
+// cleanup, such as closing the progress file and releasing the run lock, always happens.
+// Tables go to stdout; log lines and errors go to stderr.
+func run(args []string, stdout, stderr io.Writer) int {
+	o, err := parseArgs(args)
+	switch {
+	case errors.Is(err, errNoArgs):
+		writeHelp(stderr)
+		return exitUsage
+	case err != nil:
+		fmt.Fprintf(stderr, "rebalance: %v\nRun \"rebalance --help\" to see the options.\n", err)
+		return exitUsage
+	case o.help:
+		writeHelp(stdout)
+		return exitOK
+	case o.version:
+		fmt.Fprintf(stdout, "go-zfs-rebalance %s\n", version)
+		return exitOK
 	}
-
-	var (
-		processHardlinks  bool
-		passesFlag        int
-		concurrency       int
-		showHelp          bool
-		noCleanupBalance  bool
-		noRandomOrder     bool
-		debugLogging      bool
-		sizeThreshold     int
-		showVersion       bool
-		checksumType      string
-		haltOnFileMissing bool
-		showFullPaths     bool
-	)
-
-	flag.BoolVar(&processHardlinks, "process-hardlinks", false, "Process files with multiple hardlinks")
-	flag.IntVar(&passesFlag, "passes", 10, "Number of times a file may be rebalanced (0 for unlimited)")
-	flag.IntVar(&concurrency, "concurrency", 0, "Number of files to process concurrently (default: auto - half of CPU cores, minimum 2, maximum 128)")
-	flag.BoolVar(&showHelp, "help", false, "Show usage")
-	flag.BoolVar(&noCleanupBalance, "no-cleanup-balance", false, "Disable automatic removal of stale .balance files")
-	flag.BoolVar(&noRandomOrder, "no-random", false, "Process files in directory order instead of random order")
-	flag.BoolVar(&debugLogging, "debug", false, "Enable debug logging")
-	flag.IntVar(&sizeThreshold, "size-threshold", 0, "Only show success messages for files >= this size in MB")
-	flag.StringVar(&checksumType, "checksum", "sha256", "Checksum type to use (sha256 or md5)")
-	flag.BoolVar(&showVersion, "version", false, "Show version information")
-	flag.BoolVar(&haltOnFileMissing, "halt-on-missing", false, "Halt processing when a file is no longer on disk")
-	flag.BoolVar(&showFullPaths, "filename-only", false, "Display only filenames in logs instead of full paths (default: show full paths)")
-	flag.Parse()
-
-	if showVersion {
-		fmt.Printf("go-zfs-rebalance version %s\n", VERSION)
-		os.Exit(0)
+	if goos != "linux" && goos != "darwin" {
+		fmt.Fprintf(stderr, "rebalance: this tool only works on Linux and macOS, not %s, so nothing was changed\n", goos)
+		return exitUsage
 	}
-
-	if showHelp || flag.NArg() < 1 {
-		printUsage()
-		os.Exit(0)
-	}
-
-	rootPath := flag.Arg(0)
-
-	// Open DB in a temp directory
-	db, err := database.OpenSQLiteDB()
+	root, err := resolveRoot(o.path)
 	if err != nil {
-		log.Errorf("Failed to open SQLite DB: %v", err)
-		os.Exit(1)
+		fmt.Fprintf(stderr, "rebalance: %v\n", err)
+		return exitUsage
+	}
+	if o.report {
+		return report(root, stdout, stderr)
+	}
+	return rebalanceFolder(o, root, stdout, newLogger(stderr, o.debug, o.filenameOnly))
+}
+
+// rebalanceFolder is a normal run: it rewrites the files in root and returns the exit code.
+func rebalanceFolder(o options, root string, stdout io.Writer, log *logrus.Logger) int {
+	// The first signal cancels gentle: the files in progress are finished and nothing new is
+	// started. The second cancels hard: the files in progress are abandoned, each left as it was.
+	hard, stopNow := context.WithCancel(context.Background())
+	defer stopNow()
+	gentle, stopGently := context.WithCancel(hard)
+	defer stopGently()
+	defer watchSignals(log, stopGently, stopNow)()
+
+	concurrency, note := resolveConcurrency(o.concurrency, runtime.NumCPU())
+	log.Infof("Rebalancing %s", root)
+	log.Info(settingsLine(o, concurrency))
+	if note != "" {
+		log.Info(note)
+	}
+	if o.oldNoCleanup {
+		log.Info("--no-cleanup-balance is now called --no-cleanup. The old name still works for now.")
+	}
+	if os.Geteuid() != 0 {
+		log.Warn("Not running as root: files owned by other users will be skipped, never changed.")
 	}
 
-	// Clean up
+	lockDir, dbPath, err := statePaths(o.db, root)
+	if err != nil {
+		log.Errorf("Can't start: %v", err)
+		return exitUsage
+	}
+	release, err := database.AcquireLock(lockDir)
+	if err != nil {
+		log.Errorf("Can't start: %v", err)
+		return exitUsage
+	}
 	defer func() {
-		_ = db.Close(true) // true to remove the temp DB directory
+		if err := release(); err != nil {
+			log.WithField("reason", err.Error()).Debug("Couldn't release the run lock")
+		}
 	}()
-
-	log.Infof("Start rebalancing at %s", time.Now().Format("2006-01-02 15:04:05"))
-	log.Infof("OS: %s", runtime.GOOS)
-	log.Infof("Path: %s", rootPath)
-	log.Infof("Passes: %d", passesFlag)
-	log.Infof("Process Hardlinks: %t", processHardlinks)
-	log.Infof("Concurrency: %s", concurrencyStr(concurrency))
-	log.Infof("Cleanup Balance Files: %t", !noCleanupBalance)
-	log.Infof("Random Order: %t", !noRandomOrder)
-	log.Infof("Debug Logging: %t", debugLogging)
-	log.Infof("Size Threshold: %d MB", sizeThreshold)
-	log.Infof("Checksum Type: %s", checksumType)
-	log.Infof("Halt On Missing Files: %t", haltOnFileMissing)
-	log.Infof("Show Full Paths: %t", !showFullPaths)
-	log.Infof("SQLite DB Path: %s", db.Path)
-
-	// Set up log level filtering
-	if !debugLogging {
-		// Only show important messages when not in debug mode
-		log.SetLevel(logrus.WarnLevel) // Only show warnings and errors by default
-	} else {
-		log.SetLevel(logrus.InfoLevel) // Show all messages in debug mode
-	}
-
-	// Convert checksum string to ChecksumType
-	var checksumTypeEnum fileutil.ChecksumType
-	switch strings.ToLower(checksumType) {
-	case "md5":
-		checksumTypeEnum = fileutil.ChecksumMD5
-	case "sha256":
-		checksumTypeEnum = fileutil.ChecksumSHA256
-	default:
-		log.Errorf("Invalid checksum type: %s. Must be sha256 or md5", checksumType)
-		os.Exit(1)
-	}
-
-	// Calculate the actual concurrency to use
-	actualConcurrency := calculateConcurrency(concurrency)
-
-	config := &rebalance.Config{
-		SkipHardlinks:       !processHardlinks,
-		PassesLimit:         passesFlag,
-		Concurrency:         actualConcurrency,
-		RootPath:            rootPath,
-		Logger:              log,
-		CleanupBalanceFiles: !noCleanupBalance,
-		RandomOrder:         !noRandomOrder,
-		SizeThresholdMB:     sizeThreshold,
-		ChecksumType:        checksumTypeEnum,
-		HaltOnFileMissing:   haltOnFileMissing,
-		ShowFullPaths:       !showFullPaths,
-	}
-
-	rebalancer := rebalance.NewRebalancer(config, db)
-
-	// Set up signal handling for graceful shutdown
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
-
-	// Create a done channel that will be closed when we need to force exit
-	done := make(chan struct{})
-
-	// Handle signals in a separate goroutine
-	go func() {
-		sig := <-signalChan
-		log.Warnf("%sReceived signal %v, initiating graceful shutdown...%s", colorYellow, sig, colorReset)
-
-		// Signal the rebalancer to start graceful shutdown
-		rebalancer.InitiateShutdown()
-
-		// Start a timer to force exit if shutdown takes too long
-		go func() {
-			// Give processes 90 seconds to clean up
-			time.Sleep(90 * time.Second)
-			log.Warn("Shutdown timeout reached, forcing exit")
-			close(done)
-		}()
-	}()
-
-	// Create a shared progress tracker
-	progressChan := make(chan int, 100)
-	files, err := rebalancer.GetFiles()
+	db, info, err := database.Open(dbPath, root, o.resume)
 	if err != nil {
-		log.Errorf("Error getting file list: %v", err)
-		os.Exit(1)
+		log.Errorf("Can't start: %v", err)
+		return exitUsage
 	}
-	totalFiles := len(files)
-	processedFiles := 0
-
-	// Get pass information
-	currentPass, totalPasses := rebalancer.GetPassInfo()
-
-	// Function to print progress report
-	printProgress := func() {
-		// Calculate completion percentage for the current pass
-		currentPassPercentage := 0
-		if totalFiles > 0 {
-			currentPassPercentage = int(float64(processedFiles) / float64(totalFiles) * 100)
-		}
-
-		// Calculate overall completion percentage across all passes
-		overallPercentage := 0
-		if totalPasses > 0 && totalFiles > 0 {
-			passWeight := 100.0 / float64(totalPasses)
-			overallPercentage = int(float64(currentPass-1)*passWeight + float64(currentPassPercentage)*passWeight/100.0)
-		}
-
-		// Print progress in blue and bold with pass information
-		fmt.Printf("%s %s%s%sPass %d of %d: %d/%d files (%d%% of pass, %d%% overall)%s\n",
-			time.Now().Format("3:04:05 PM"),
-			colorBlue, colorBold, "",
-			currentPass, totalPasses,
-			processedFiles, totalFiles,
-			currentPassPercentage,
-			overallPercentage,
-			colorReset)
-	}
-
-	// Show initial progress
-	printProgress()
-
-	// Start a periodic progress reporter
-	progressReporter := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(1 * time.Minute)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ticker.C:
-				printProgress()
-
-			case count := <-progressChan:
-				processedFiles = count
-
-			case <-progressReporter:
-				return
-			}
+	defer func() {
+		if err := db.Close(); err != nil {
+			log.WithField("reason", err.Error()).Warn("Couldn't close the progress file cleanly; a resumed run may redo a few files")
 		}
 	}()
+	logOpenInfo(log, info, db.Path())
 
-	// Track if any passes had failures
-	overallFailure := false
-
-	// Run all passes in sequence
-	for pass := currentPass; pass <= totalPasses; pass++ {
-		// Reset for the new pass
-		processedFiles = 0
-
-		// Get updated file list (some may have reached pass limit)
-		files, err = rebalancer.GetFiles()
-		if err != nil {
-			log.Errorf("Error getting file list for pass %d: %v", pass, err)
-			overallFailure = true
-			break
-		}
-
-		totalFiles = len(files)
-		if totalFiles == 0 {
-			log.Infof("No files to process in pass %d.", pass)
-			break
-		}
-
-		// Get updated pass info
-		currentPass, _ = rebalancer.GetPassInfo()
-
-		// Skip iteration if we've moved beyond our intended pass
-		// (could happen if another process has incremented file counts)
-		if currentPass > pass {
-			continue
-		}
-
-		// Show progress update with new pass info
-		printProgress()
-
-		// Run the current pass
-		log.Infof("Starting pass %d of %d with %d files", currentPass, totalPasses, totalFiles)
-
-		// Run the rebalancer in a goroutine
-		passDone := make(chan struct{})
-		go func() {
-			err = rebalancer.Run(progressChan)
-			close(passDone)
-		}()
-
-		// Wait for either rebalancer to finish or a forced exit
-		select {
-		case <-passDone:
-			// Normal completion - print final progress for this pass
-			printProgress()
-
-			// Check for errors in this pass
-			if err != nil {
-				log.Warnf("Pass %d completed with some failures: %v", currentPass, err)
-				overallFailure = true
-			} else {
-				log.Infof("Pass %d completed successfully", currentPass)
-			}
-
-		case <-done:
-			// Forced exit due to timeout
-			close(progressReporter)
-			log.Error("Forced exit: rebalance operation did not complete gracefully in time")
-			os.Exit(1)
-		}
+	z := &zfsView{client: newZFSClient(), log: log}
+	z.lookup(gentle, root)
+	z.checkDataset(gentle)
+	if gentle.Err() != nil {
+		return stoppedBeforeStart(log)
 	}
 
-	// Stop the progress reporter
-	close(progressReporter)
-
-	// Show completion message
-	if overallFailure {
-		log.Error("Some files failed to rebalance during one or more passes")
-		os.Exit(1)
-	} else {
-		log.Info("All passes completed successfully")
+	r, err := rebalance.New(rebalance.Config{
+		Root:             root,
+		Passes:           o.passes,
+		Concurrency:      concurrency,
+		ProcessHardlinks: o.processHardlinks,
+		Cleanup:          !o.noCleanup,
+		RandomOrder:      !o.noRandom,
+		Checksum:         o.checksumType,
+		HaltOnMissing:    o.haltOnMissing,
+		SizeThresholdMB:  o.sizeThresholdMB,
+		Exclude:          append(db.Files(), filepath.Join(lockDir, lockFileName)),
+		Logger:           log,
+		State:            db,
+	})
+	if err != nil {
+		log.Errorf("Can't start: %v", err)
+		return exitUsage
 	}
+	defer r.Close()
+	stopOnSignal := context.AfterFunc(gentle, r.Stop)
+	defer stopOnSignal()
+
+	log.Info("Looking through the folder to see what needs doing…")
+	plan, err := r.Scan(gentle)
+	switch {
+	case gentle.Err() != nil:
+		return stoppedBeforeStart(log)
+	case err != nil:
+		log.WithField("reason", err.Error()).Error("Couldn't look through the folder, so nothing was changed")
+		return exitFailed
+	}
+	logPlan(log, plan, !o.noCleanup)
+	z.checkSpace(gentle, plan, concurrency)
+	var before *vdevBefore
+	if o.vdevReport {
+		before = z.reportBefore(gentle, stdout)
+	}
+	if gentle.Err() != nil {
+		return stoppedBeforeStart(log)
+	}
+
+	stopProgress := startProgress(log, r, progressInterval)
+	summary, err := r.Execute(hard, plan)
+	stopProgress()
+	if err != nil {
+		log.WithField("reason", err.Error()).Error("Couldn't start rewriting files")
+		return exitFailed
+	}
+	logSummary(log, summary, o)
+	if before != nil {
+		z.reportAfter(gentle, hard, stdout, before)
+	}
+	return exitCode(summary)
+}
+
+// statePaths returns the folder holding the run lock and the progress file to use for root.
+// With --db, the lock sits next to that file.
+func statePaths(dbFlag, root string) (lockDir, dbPath string, err error) {
+	if dbFlag != "" {
+		if dbPath, err = filepath.Abs(dbFlag); err != nil {
+			return "", "", fmt.Errorf("couldn't work out the full path of --db %q (%s)", dbFlag, reasonOf(err))
+		}
+		return filepath.Dir(dbPath), dbPath, nil
+	}
+	if lockDir, err = database.DefaultDir(); err != nil {
+		return "", "", err
+	}
+	if dbPath, err = database.DefaultPath(root); err != nil {
+		return "", "", err
+	}
+	return lockDir, dbPath, nil
+}
+
+func settingsLine(o options, concurrency int) string {
+	order := "a random order"
+	if o.noRandom {
+		order = "folder order"
+	}
+	line := fmt.Sprintf("Settings: %s at a time, in %s, each copy checked with %s", countFiles(concurrency), order, o.checksumType)
+	if o.passes > 1 {
+		line += fmt.Sprintf(", each file rewritten up to %d times across resumed runs", o.passes)
+	}
+	if o.processHardlinks {
+		line += ", hardlinked files included"
+	}
+	if o.haltOnMissing {
+		line += ", stopping if a file goes missing"
+	}
+	if o.noCleanup {
+		line += ", leftover temporary files kept"
+	}
+	return line + "."
+}
+
+// logOpenInfo says what happened to the saved progress for this folder.
+func logOpenInfo(log *logrus.Logger, info database.OpenInfo, dbPath string) {
+	switch {
+	case info.Resumed:
+		log.Infof("Resuming where the last run stopped (it had rewritten %s).", countFiles(info.PreviousEntries))
+	case info.MissingForResume:
+		log.Warn("There's no saved progress for this folder to resume, so starting from the beginning.")
+	case info.Discarded && info.PreviousEntries > 0:
+		log.Warnf("Starting fresh, so the saved progress of an earlier run (%s rewritten) was discarded. Next time, add --resume to carry on where it stopped.",
+			countFiles(info.PreviousEntries))
+	}
+	log.Debugf("Progress is saved in %s", dbPath)
+}
+
+// logPlan describes what Scan found, warning about anything that needs a person's attention.
+func logPlan(log *logrus.Logger, plan *rebalance.Plan, cleanup bool) {
+	if plan.TotalFiles > 0 {
+		log.Infof("Found %s to rebalance (%s).", countFiles(plan.TotalFiles), zfs.FormatBytes(uint64(plan.TotalBytes)))
+	}
+	if n := len(plan.OrphanBalance); n > 0 {
+		log.Warn(choose(n,
+			"Found a file ending in .balance with no original next to it. It looks like a leftover from version 1 and may be the only copy of a file — please check it. It won't be touched:",
+			fmt.Sprintf("Found %s files ending in .balance with no original next to them. They look like leftovers from version 1 and may be the only copies of some files — please check them. They won't be touched:", thousands(n))))
+		for _, rel := range plan.OrphanBalance[:min(n, maxListed)] {
+			log.WithFields(logrus.Fields{"op": opListed, "path": rel}).Warn()
+		}
+		if n > maxListed {
+			log.Warnf("…and %s more", thousands(n-maxListed))
+		}
+	}
+	if n := len(plan.LegacyBalance) - len(plan.OrphanBalance); n > 0 {
+		log.Info(choose(n,
+			"Found a file ending in .balance next to one with the same name without it. Version 1 used names like that for its temporary copies, so it may be a leftover worth checking. It will be rewritten like any other file.",
+			fmt.Sprintf("Found %s files ending in .balance next to ones with the same name without it. Version 1 used names like that for its temporary copies, so they may be leftovers worth checking. They'll be rewritten like any other file.", thousands(n))))
+	}
+	if n := len(plan.StaleTemps); n > 0 && !cleanup {
+		log.Warn(choose(n,
+			"Found a temporary file left behind by an interrupted run. It was kept because of --no-cleanup; run without it to remove it.",
+			fmt.Sprintf("Found %s temporary files left behind by an interrupted run. They were kept because of --no-cleanup; run without it to remove them.", thousands(n))))
+	}
+}
+
+func stoppedBeforeStart(log *logrus.Logger) int {
+	log.Warn("Stopped before any files were changed.")
+	return exitInterrupted
+}
+
+// choose returns one when n is 1, and many otherwise.
+func choose(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
