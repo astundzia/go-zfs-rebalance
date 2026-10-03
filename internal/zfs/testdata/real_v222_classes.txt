@@ -1,0 +1,15 @@
+fx	989855744	100891648	888964096
+	raidz1-0	738197504	100663296	637534208	-	-	0	13	-	ONLINE
+	/var/tmp/fx/r1	268435456	-	-	-	-	-	-	-	ONLINE
+	/var/tmp/fx/r2	268435456	-	-	-	-	-	-	-	ONLINE
+	/var/tmp/fx/r3	268435456	-	-	-	-	-	-	-	ONLINE
+special                 -      -      -        -         -      -      -      -         -
+	mirror-1	251658240	228352	251429888	-	-	3	0	-	ONLINE
+	/var/tmp/fx/s1	268435456	-	-	-	-	-	-	-	ONLINE
+	/var/tmp/fx/s2	268435456	-	-	-	-	-	-	-	ONLINE
+logs                    -      -      -        -         -      -      -      -         -
+	/var/tmp/fx/l1	268435456	0	251658240	-	-	0	0	-	ONLINE
+cache                   -      -      -        -         -      -      -      -         -
+	/var/tmp/fx/c1	268435456	5379072	258337280	-	-	0	2	-	ONLINE
+spare                   -      -      -        -         -      -      -      -         -
+	/var/tmp/fx/sp1	268435456	-	-	-	-	-	-	-	AVAIL

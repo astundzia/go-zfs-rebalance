@@ -1,0 +1,7 @@
+Pool tank   USED%            ALLOC CHANGE
+mirror-0    81.0% -> 81.0%            0 B
+mirror-1    12.5% ->     -              -
+mirror-2        - -> 40.0%              -
+spread      68.5 pts -> 41.0 pts
+note: old blocks are still pinned by snapshots, so the old vdevs won't shrink until those snapshots are destroyed
+note: timed out waiting for ZFS to finish freeing space, so the numbers may still change

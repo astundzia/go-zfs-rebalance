@@ -1,0 +1,5 @@
+Pool tank   USED%            ALLOC CHANGE
+raidz1-0    69.7% -> 46.3%       -5.1 TiB
+raidz1-1    55.0% -> 44.0%       -2.4 TiB
+raidz1-2     8.3% -> 42.7%       +7.5 TiB
+spread      61.4 pts -> 3.6 pts

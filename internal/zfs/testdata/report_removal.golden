@@ -1,0 +1,4 @@
+Pool tank      SIZE     ALLOC   USED%
+mirror-1    3.6 TiB   2.3 TiB   64.0%
+mirror-2    3.6 TiB   1.1 TiB   31.0%
+spread      33.0 pts
