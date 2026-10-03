@@ -1,0 +1,6 @@
+Pool tank       SIZE      ALLOC   USED%
+raidz1-0    29.1 TiB   20.3 TiB   69.7%
+raidz1-1    29.1 TiB   16.0 TiB   55.0%
+raidz1-2    29.1 TiB    2.4 TiB    8.3%
+spread      61.4 pts
+also: special mirror-3 (0.9/1.8 TiB), log mirror-4, cache nvme0n1, spare 1b70c69e-f82d-4e14-99fc-4d8b0a6c29f1

@@ -1,0 +1,3 @@
+Pool backup       SIZE     ALLOC   USED%
+raidz2-0      21.8 TiB   9.2 TiB   42.0%
+spread        0.0 pts

@@ -1,0 +1,5 @@
+Pool tank      SIZE       ALLOC   USED%
+sda         3.6 TiB     2.5 TiB   70.0%
+sdb         3.6 TiB     2.0 TiB   55.0%
+sdc         3.6 TiB   308.1 GiB    8.3%
+spread      61.7 pts

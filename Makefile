@@ -1,113 +1,94 @@
-.PHONY: all clean test unit-test integration-test build build-all build-debug build-all-debug package install install-debug run run-debug lint copy-to-dist
+# go-zfs-rebalance build tasks (GNU make on macOS or Linux).
+#   make            build bin/rebalance for this computer
+#   make test       run all tests with the race detector (on Linux this needs gcc or clang)
+#   make lint       vet, staticcheck and shellcheck
+#   make dist       release binaries, checksums and install.sh in dist/
+#   make help       list every target
 
-BINARY_NAME=rebalance
-MAIN_PKG=./cmd/rebalance
-DOCKER_TEST_IMAGE=rebalance-test:latest
-BUILDX_PLATFORMS=linux/amd64,linux/arm64,windows/amd64
+BINARY  := rebalance
+PKG     := ./cmd/rebalance
+GO      ?= go
+BINDIR  ?= /usr/local/bin
 
-all: clean build-all test package copy-to-dist
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS := -s -w -X main.version=$(VERSION)
 
-clean:
-	rm -rf bin/ dist/
+# staticcheck 2026.2.1. Keep in sync with .github/workflows/ci.yml.
+STATICCHECK := honnef.co/go/tools/cmd/staticcheck@v0.8.1
 
-test:
-	@echo "===== RUNNING TESTS ====="
-	go test -v ./internal/... ./pkg/... ./tests
+# Release targets. Only Linux and macOS are supported.
+PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 
-unit-test:
-	@echo "===== RUNNING LOCAL UNIT TESTS ====="
-	go test -v ./internal/... ./pkg/... ./tests
+# Both print "<hash>  <name>", the format the installer and `sha256sum -c` expect.
+SHA256 := $(shell command -v sha256sum >/dev/null 2>&1 && echo sha256sum || echo 'shasum -a 256')
 
-integration-test:
-	go test -v ./tests/integration/...
+# Release files must be built with at least the Go named on go.mod's toolchain line: older
+# Go releases have security bugs in os.Root, which rebalance relies on to stay inside the folder.
+MIN_GO := $(shell awk '$$1 == "toolchain" { print $$2 }' go.mod)
 
-buildx-test-image:
-	docker build -t $(DOCKER_TEST_IMAGE) -f Dockerfile.test .
-
-buildx-test: buildx-test-image
-	@echo "===== RUNNING TESTS VIA DOCKER ====="
-	@/bin/bash -c '\
-		platforms="$(BUILDX_PLATFORMS)"; \
-		IFS="," read -ra ADDR <<< "$$platforms"; \
-		for plat in "$${ADDR[@]}"; do \
-			echo "--- Testing $$plat ---"; \
-			docker run --rm -e TARGET_PLATFORM="$$plat" $(DOCKER_TEST_IMAGE) || exit 1; \
-		done \
-	'
-	@echo "===== ALL DOCKER TESTS COMPLETED ====="
-
-lint:
-	@echo "===== RUNNING GOLANGCI-LINT ======"
-	golangci-lint run ./...
-	@echo "===== LINTING COMPLETE ======"
+.PHONY: build test test-short lint dist install clean help
 
 build:
-	mkdir -p bin/$(shell go env GOOS)_$(shell go env GOARCH)
-	CGO_ENABLED=1 go build -o bin/$(shell go env GOOS)_$(shell go env GOARCH)/$(BINARY_NAME)-$(shell go env GOOS)-$(shell go env GOARCH) $(MAIN_PKG)
-	ln -sf $(BINARY_NAME)-$(shell go env GOOS)-$(shell go env GOARCH) bin/$(shell go env GOOS)_$(shell go env GOARCH)/$(BINARY_NAME)
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o bin/$(BINARY) $(PKG)
 
-build-debug:
-	@echo "===== BUILDING DEBUG VERSION WITH RACE DETECTOR ====="
-	mkdir -p bin/$(shell go env GOOS)_$(shell go env GOARCH)
-	CGO_ENABLED=1 go build -race -o bin/$(shell go env GOOS)_$(shell go env GOARCH)/$(BINARY_NAME)-$(shell go env GOOS)-$(shell go env GOARCH)-debug $(MAIN_PKG)
-	ln -sf $(BINARY_NAME)-$(shell go env GOOS)-$(shell go env GOARCH)-debug bin/$(shell go env GOOS)_$(shell go env GOARCH)/$(BINARY_NAME)-debug
-	@echo "Debug binary with race detector available at bin/$(shell go env GOOS)_$(shell go env GOARCH)/$(BINARY_NAME)-debug"
+test:
+	@if [ "$$($(GO) env GOOS)" = linux ] && [ "$$($(GO) env CGO_ENABLED)" != 1 ]; then \
+		echo "The race detector needs a C compiler on Linux. Please install gcc (or clang) and try again,"; \
+		echo "or run 'make test-short' to test without it."; \
+		exit 1; \
+	fi
+	$(GO) test -race ./...
 
-build-all:
-	@echo "===== BUILDING SEQUENTIALLY FOR ALL PLATFORMS ====="
-	@./scripts/build-and-test.sh
-	@echo "===== BUILD COMPLETED ====="
-	@echo "Binaries output to bin/ directory"
+test-short:
+	$(GO) test -short ./...
 
-build-all-debug:
-	@echo "===== BUILDING DEBUG VERSIONS WITH RACE DETECTOR FOR ALL PLATFORMS ====="
-	@DEBUG=1 ./scripts/build-and-test.sh
-	@echo "===== DEBUG BUILD COMPLETED ====="
-	@echo "Debug binaries with race detector output to bin/ directory"
+lint:
+	$(GO) vet ./...
+	GOOS=linux GOARCH=amd64 $(GO) vet ./...
+	GOOS=linux GOARCH=arm64 $(GO) vet ./...
+	GOOS=darwin GOARCH=arm64 $(GO) vet ./...
+	GOOS=windows GOARCH=amd64 $(GO) vet ./...
+	$(GO) run $(STATICCHECK) ./...
+	shellcheck -s sh install.sh
+	shellcheck test/lab/lab.sh
 
-copy-to-dist: build-all
-	@echo "===== COPYING PLATFORM BINARIES TO DIST ====="
-	scripts/copy_to_dist.sh
-	@echo "===== PLATFORM BINARIES COPIED ====="
-	@echo "Individual binaries available in dist/ directory"
-
-package: build-all
-	scripts/package.sh
+dist:
+	rm -rf dist
+	mkdir -p dist
+	@set -e; for p in $(PLATFORMS); do \
+		os=$${p%/*}; arch=$${p#*/}; name=$(BINARY)-$$os-$$arch; \
+		echo "building dist/$$name ($(VERSION))"; \
+		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o dist/$$name $(PKG); \
+		(cd dist && $(SHA256) $$name > $$name.sha256); \
+		v=$$($(GO) version dist/$$name | awk '{ print $$2 }'); \
+		if [ "$$(printf '%s\n' $(MIN_GO) $$v | sort -V | head -n 1)" != "$(MIN_GO)" ]; then \
+			echo "dist/$$name was built with $$v, but release files need $(MIN_GO) or newer,"; \
+			echo "which fixes security bugs in os.Root. Please update Go, or unset GOTOOLCHAIN=local."; \
+			exit 1; \
+		fi; \
+	done
+	cp install.sh dist/install.sh
+	chmod 755 dist/install.sh
+	cd dist && $(SHA256) $(foreach p,$(PLATFORMS),$(BINARY)-$(subst /,-,$(p))) install.sh > checksums.txt
+	@echo "Release files are ready in dist/:"
+	@cat dist/checksums.txt
 
 install:
-	@OS=$$(go env GOOS); ARCH=$$(go env GOARCH); \
-	 if [ -f "bin/$${OS}_$${ARCH}/$(BINARY_NAME)-$${OS}-$${ARCH}" ]; then \
-		 cp "bin/$${OS}_$${ARCH}/$(BINARY_NAME)-$${OS}-$${ARCH}" /usr/local/bin/$(BINARY_NAME); \
-		 echo "Installed bin/$${OS}_$${ARCH}/$(BINARY_NAME)-$${OS}-$${ARCH} to /usr/local/bin/$(BINARY_NAME)"; \
-	 else \
-		 echo "Binary for $${OS}/$${ARCH} not found in bin/. Run 'make build' or 'make build-all' first."; \
-		 exit 1; \
-	 fi
+	@test -f bin/$(BINARY) || { echo "Please run 'make build' first (without sudo), then 'sudo make install'."; exit 1; }
+	install -d $(DESTDIR)$(BINDIR)
+	install -m 0755 bin/$(BINARY) $(DESTDIR)$(BINDIR)/$(BINARY)
+	@echo "Installed $(BINDIR)/$(BINARY)."
+	@echo "Next, see how evenly a pool is filled (this changes nothing):"
+	@echo "  sudo $(BINDIR)/$(BINARY) --report /mnt/tank/media"
 
-install-debug:
-	@OS=$$(go env GOOS); ARCH=$$(go env GOARCH); \
-	 if [ -f "bin/$${OS}_$${ARCH}/$(BINARY_NAME)-$${OS}-$${ARCH}-debug" ]; then \
-		 cp "bin/$${OS}_$${ARCH}/$(BINARY_NAME)-$${OS}-$${ARCH}-debug" /usr/local/bin/$(BINARY_NAME)-debug; \
-		 echo "Installed bin/$${OS}_$${ARCH}/$(BINARY_NAME)-$${OS}-$${ARCH}-debug to /usr/local/bin/$(BINARY_NAME)-debug"; \
-	 else \
-		 echo "Debug binary for $${OS}/$${ARCH} not found in bin/. Run 'make build-debug' first."; \
-		 exit 1; \
-	 fi
+clean:
+	rm -rf bin dist
 
-run:
-	@OS=$$(go env GOOS); ARCH=$$(go env GOARCH); \
-	 if [ -f "bin/$${OS}_$${ARCH}/$(BINARY_NAME)-$${OS}-$${ARCH}" ]; then \
-		 "bin/$${OS}_$${ARCH}/$(BINARY_NAME)-$${OS}-$${ARCH}" $${ARGS}; \
-	 else \
-		 echo "Binary for $${OS}/$${ARCH} not found in bin/. Run 'make build' or 'make build-all' first."; \
-		 exit 1; \
-	 fi
-
-run-debug:
-	@OS=$$(go env GOOS); ARCH=$$(go env GOARCH); \
-	 if [ -f "bin/$${OS}_$${ARCH}/$(BINARY_NAME)-$${OS}-$${ARCH}-debug" ]; then \
-		 "bin/$${OS}_$${ARCH}/$(BINARY_NAME)-$${OS}-$${ARCH}-debug" $${ARGS}; \
-	 else \
-		 echo "Debug binary for $${OS}/$${ARCH} not found in bin/. Run 'make build-debug' first."; \
-		 exit 1; \
-	 fi
+help:
+	@echo "make build       build bin/$(BINARY) for this computer"
+	@echo "make test        run all tests with the race detector"
+	@echo "make test-short  run the quick tests only"
+	@echo "make lint        go vet (this OS, Linux, macOS, Windows), staticcheck, shellcheck"
+	@echo "make dist        build release files into dist/ (set VERSION=v2.0.0)"
+	@echo "make install     copy bin/$(BINARY) to $(BINDIR) (use sudo)"
+	@echo "make clean       remove bin/ and dist/"

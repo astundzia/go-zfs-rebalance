@@ -1,42 +1,30 @@
-# Binaries for programs and plugins
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
+# Build output (make build, make dist)
+/bin/
+/dist/
+/rebalance
 
-# Output of the go coverage tool, specifically when used with LiteIDE
-*.out
+# Test binaries, coverage and profiles (top level only, so testdata fixtures are never hidden)
+/*.test
+/*.out
+/*.prof
+/coverage.*
 
-# Dependency directories (remove the comment below to include it)
-# vendor/
-
-# Go workspace file
+# Go workspace files
 go.work
 go.work.sum
 
-# Build output
-bin/
-dist/
+# Release notes written by the release workflow
+/notes.md
 
-# SQLite database file used for tracking passes
-rebalance_state.db
-rebalance_state.db-journal
+# Editors
+.idea/
+.vscode/
+*.swp
+*~
 
-# The generated executable name (adjust if needed)
-go-zfs-rebalance
-
-# OS generated files #
-####################
+# macOS and Windows clutter
 .DS_Store
-.DS_Store?
 ._*
 .Spotlight-V100
 .Trashes
-ehthumbs.db
-Thumbs.db 
-
-*.log
-*.txt
-/rebalance
-/zfs-rebalance
+Thumbs.db

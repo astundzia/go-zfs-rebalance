@@ -1,193 +1,127 @@
+// Package fileutil rewrites a file in place so that its data lands on fresh blocks, while keeping
+// everything else about it (contents, owner, permissions, extended attributes, ACLs, timestamps
+// and, on Linux, chattr flags, project ID and ZFS DOS attributes) exactly the same.
+//
+// The original is never removed or truncated: a verified copy is built under a temporary name in
+// the same directory and then atomically renamed over the original. If anything goes wrong, or the
+// context is cancelled, the temporary copy is removed and the original is left untouched. While a
+// temporary copy exists it is locked, so another run can tell it apart from one left behind by a
+// run that was killed (see RemoveStaleTemp).
 package fileutil
 
 import (
-	"crypto/md5"
-	"crypto/sha256"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
-	"io"
 	"os"
-	"runtime"
+	"strings"
+	"time"
 )
 
-// GetLinkCount returns the number of hardlinks to a file.
-func GetLinkCount(path string) (uint64, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return 0, err
+// Temporary copies are named TempPrefix + 12 lowercase hex digits + TempSuffix (31 bytes), short
+// enough that even a file whose own name is at the length limit can be rewritten next to it.
+const (
+	TempPrefix = ".zfs-rebalance."
+	TempSuffix = ".tmp"
+)
+
+const tempHexLen = 12
+
+// IsTempName reports whether base (a file name without directories) is exactly the name of one of
+// our temporary copies.
+func IsTempName(base string) bool {
+	if len(base) != len(TempPrefix)+tempHexLen+len(TempSuffix) ||
+		!strings.HasPrefix(base, TempPrefix) || !strings.HasSuffix(base, TempSuffix) {
+		return false
 	}
-
-	nlink, err := getLinkCountForPlatform(info)
-	if err != nil {
-		return 0, fmt.Errorf("unsupported system for file %s: %w", path, err)
-	}
-
-	return nlink, nil
-}
-
-// CheckAttributes checks basic attributes: size, mode, uid, gid, and modification time.
-func CheckAttributes(orig, copy string) (bool, string) {
-	origInfo, err := os.Stat(orig)
-	if err != nil {
-		return false, fmt.Sprintf("cannot stat original file: %v", err)
-	}
-
-	copyInfo, err := os.Stat(copy)
-	if err != nil {
-		return false, fmt.Sprintf("cannot stat copy file: %v", err)
-	}
-
-	// Size
-	if origInfo.Size() != copyInfo.Size() {
-		return false, "size mismatch"
-	}
-
-	// Mode
-	if origInfo.Mode() != copyInfo.Mode() {
-		return false, "mode mismatch"
-	}
-
-	// Compare UID/GID if possible
-	if runtime.GOOS != "windows" {
-		origUID, origGID, err1 := getFileOwnership(origInfo)
-		copyUID, copyGID, err2 := getFileOwnership(copyInfo)
-
-		if err1 == nil && err2 == nil {
-			if origUID != copyUID {
-				return false, "uid mismatch"
-			}
-			if origGID != copyGID {
-				return false, "gid mismatch"
-			}
+	for _, c := range base[len(TempPrefix) : len(TempPrefix)+tempHexLen] {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
 		}
 	}
-
-	// Compare modification time
-	if !origInfo.ModTime().Equal(copyInfo.ModTime()) {
-		return false, "mod time mismatch"
-	}
-
-	return true, ""
+	return true
 }
 
-// ChecksumType defines the type of checksum to use
+func randomTempName() string {
+	var b [tempHexLen / 2]byte
+	_, _ = rand.Read(b[:]) // never fails
+	return TempPrefix + hex.EncodeToString(b[:]) + TempSuffix
+}
+
+// ChecksumType selects the hash used to check that the new copy matches the original.
 type ChecksumType string
 
+// Supported checksum types.
 const (
-	// ChecksumSHA256 uses SHA256 for file verification
 	ChecksumSHA256 ChecksumType = "sha256"
-	// ChecksumMD5 uses MD5 for file verification
-	ChecksumMD5 ChecksumType = "md5"
+	ChecksumMD5    ChecksumType = "md5"
 )
 
-// CompareFileChecksum compares two files by their checksums using the specified algorithm.
-// SHA256 is used by default.
-func CompareFileChecksum(orig, copy string, checksumType ChecksumType) (bool, string) {
-	switch checksumType {
-	case ChecksumMD5:
-		return CompareFileMD5(orig, copy)
+// ParseChecksumType turns user input such as "SHA256" or "md5" into a ChecksumType.
+func ParseChecksumType(s string) (ChecksumType, error) {
+	switch ChecksumType(strings.ToLower(strings.TrimSpace(s))) {
 	case ChecksumSHA256:
-		return CompareFileSHA256(orig, copy)
-	default:
-		// Default to SHA256
-		return CompareFileSHA256(orig, copy)
+		return ChecksumSHA256, nil
+	case ChecksumMD5:
+		return ChecksumMD5, nil
 	}
+	return "", fmt.Errorf("%q isn't a checksum this tool knows; use sha256 (the default) or md5", s)
 }
 
-// CompareFileMD5 compares two files by their MD5 checksums.
-func CompareFileMD5(orig, copy string) (bool, string) {
-	origHash, err := FileHashMD5(orig)
-	if err != nil {
-		return false, fmt.Sprintf("error hashing original: %v", err)
-	}
+// FileID identifies an inode: the device it lives on and its inode number.
+type FileID struct{ Dev, Ino uint64 }
 
-	copyHash, err := FileHashMD5(copy)
-	if err != nil {
-		return false, fmt.Sprintf("error hashing copy: %v", err)
-	}
-
-	if origHash != copyHash {
-		return false, fmt.Sprintf("MD5 mismatch: %s != %s", origHash, copyHash)
-	}
-
-	return true, ""
+// Info is the subset of a file's status that the rewrite has to preserve or watch for changes.
+type Info struct {
+	ID     FileID
+	Size   int64
+	Blocks int64       // bytes allocated on disk (st_blocks × 512); less than Size for sparse or compressed files
+	Mode   os.FileMode // full Go mode, including setuid, setgid and sticky bits
+	Nlink  uint64
+	UID    uint32
+	GID    uint32
+	Atime  time.Time
+	Mtime  time.Time
+	Ctime  time.Time
 }
 
-// CompareFileSHA256 compares two files by their SHA256 checksums.
-func CompareFileSHA256(orig, copy string) (bool, string) {
-	origHash, err := FileHashSHA256(orig)
+// Lstat returns Info for rel inside root without following a final symlink.
+func Lstat(root *os.Root, rel string) (Info, error) {
+	fi, err := root.Lstat(rel)
 	if err != nil {
-		return false, fmt.Sprintf("error hashing original: %v", err)
+		return Info{}, err
 	}
-
-	copyHash, err := FileHashSHA256(copy)
-	if err != nil {
-		return false, fmt.Sprintf("error hashing copy: %v", err)
-	}
-
-	if origHash != copyHash {
-		return false, fmt.Sprintf("SHA256 mismatch: %s != %s", origHash, copyHash)
-	}
-
-	return true, ""
+	return InfoOf(fi)
 }
 
-// FileHashMD5 returns the hexadecimal MD5 of a file.
-func FileHashMD5(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	h := md5.New()
-	_, err = io.Copy(h, f)
-	if err != nil {
-		return "", err
-	}
-
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
+// Options tune ReplaceInPlace and ReplaceGroup. The zero value is ready to use.
+type Options struct {
+	Checksum   ChecksumType // defaults to sha256
+	BufferSize int          // bytes per read; defaults to 1 MiB
 }
 
-// FileHashSHA256 returns the hexadecimal SHA256 of a file.
-func FileHashSHA256(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
+const defaultBufferSize = 1 << 20
 
-	h := sha256.New()
-	_, err = io.Copy(h, f)
-	if err != nil {
-		return "", err
-	}
-
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
+// Result describes a successful rewrite.
+type Result struct {
+	Size     int64         // bytes copied
+	Duration time.Duration // wall time for the whole rewrite
+	Before   Info          // the original inode, as it was before the rewrite
+	NewID    FileID        // the inode now behind the name(s)
 }
 
-// CopyFile copies src to dst, preserving the mode and mod time. Does not handle reflinks.
-func CopyFile(src, dst string) error {
-	s, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer s.Close()
-
-	statSrc, err := s.Stat()
-	if err != nil {
-		return err
-	}
-
-	d, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, statSrc.Mode())
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-
-	if _, err = io.Copy(d, s); err != nil {
-		return err
-	}
-
-	// Preserve mod time
-	return os.Chtimes(dst, statSrc.ModTime(), statSrc.ModTime())
+// ReplaceInPlace atomically replaces root/rel with a verified copy on new blocks that has the same
+// contents and metadata. rel is slash-separated and relative to root.
+//
+// The original is never removed before the new copy is complete and verified; the swap is a single
+// rename over it. On any error or context cancellation the temporary copy is removed and the
+// original is left untouched; on Linux it is read without updating its access time where the
+// kernel allows that (as root, or as the file's owner). A file that another run or program has
+// locked (ErrBusy), that can't be given the original's owner (ErrOwnership), that is marked
+// immutable, append-only or undeletable (ErrImmutable, ErrUndeletable) or whose project ID its
+// folder won't take (ErrProjectID) is refused before any data is copied. A file with more than one
+// hardlink is refused with ErrLinkMismatch; use ReplaceGroup for those.
+func ReplaceInPlace(ctx context.Context, root *os.Root, rel string, opts Options) (Result, error) {
+	return ReplaceGroup(ctx, root, []string{rel}, opts)
 }
