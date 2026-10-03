@@ -8,11 +8,13 @@ Writes incompressible data so ZFS compression can't hide allocation. Users 'alic
 --acl nfs4 works on TrueNAS SMB-style datasets (aclmode=restricted), where chmod is refused while a file
   has a non-trivial ACL: the ACL is stripped first, then the mode set, then the test ACEs added.
 --flags (Linux) adds files with inode flags (nodump, immutable, append-only), ZFS project IDs and, on
-  ZFS, DOS attributes. Immutable, append-only and no-unlink files can't be deleted until
-  `datagen.py --clear-flags <root>` has been run.
+  ZFS, DOS attributes, plus a file with a capability (security.capability) and one with a trusted.*
+  xattr, which must be rewritten with both kept. Immutable, append-only and no-unlink files can't be
+  deleted until `datagen.py --clear-flags <root>` has been run.
 --outside DIR creates a hardlink partner outside <root> (that group must be left alone).
---skip-out FILE receives the relative paths a default run is expected to leave alone (hardlinked files,
-  .balance files with no original next to them, and immutable files).
+--skip-out FILE receives the relative paths a default run is expected to leave alone: hardlinked files,
+  .balance files with no original next to them, immutable, append-only and no-unlink files, the file
+  whose project ID differs from its +P folder's, and the setuid file with an NFSv4 ACE.
 """
 import argparse
 import fcntl
@@ -34,6 +36,15 @@ FS_IMMUTABLE_FL, FS_APPEND_FL = 0x10, 0x20
 ZFS_IOC_GETDOSFLAGS, ZFS_IOC_SETDOSFLAGS = 0x80088301, 0x40088302
 ZFS_READONLY, ZFS_HIDDEN, ZFS_SYSTEM, ZFS_ARCHIVE = 1 << 32, 1 << 33, 1 << 34, 1 << 35
 ZFS_IMMUTABLE, ZFS_NOUNLINK, ZFS_APPENDONLY = 1 << 36, 1 << 37, 1 << 38
+# linux/capability.h: a version 2 security.capability value (struct vfs_cap_data) is a magic word
+# with the effective flag, then permitted and inheritable masks for capabilities 0-31 and 32-63.
+VFS_CAP_REVISION_2, VFS_CAP_FLAGS_EFFECTIVE = 0x02000000, 0x000001
+CAP_NET_RAW = 13
+
+
+def capability_xattr(cap):
+    """The security.capability value `setcap <cap>=ep` writes, for a capability below 32."""
+    return struct.pack("<5I", VFS_CAP_REVISION_2 | VFS_CAP_FLAGS_EFFECTIVE, 1 << cap, 0, 0, 0)
 
 
 def write_random(path, size):
@@ -84,9 +95,10 @@ def ioctl_u64(path, request, value=0):
 
 
 def make_flag_files(root, skip):
-    """Files whose inode flags, project IDs and DOS attributes rebalance must keep (or, for
-    immutable ones, leave alone). Returns the changes to make once timestamps are set, since an
-    immutable or append-only file refuses new times."""
+    """Files whose inode flags, project IDs, DOS attributes, capabilities and trusted.* xattrs
+    rebalance must keep (or, for the ones it can't replace, leave alone; those go in skip).
+    Returns the changes to make once timestamps are set, since an immutable or append-only file
+    refuses new times."""
     if not sys.platform.startswith("linux"):
         sys.exit("--flags needs Linux (chattr and the ZFS ioctls)")
     fl = f"{root}/flags"
@@ -100,16 +112,20 @@ def make_flag_files(root, skip):
     chattr("+d", f"{fl}/nodump.bin")
     write_random(f"{fl}/project.bin", 200_000)
     chattr("-p", "4242", f"{fl}/project.bin")
-    # A folder whose new files inherit project 777, holding one that inherited it and one that
-    # was moved to 888 afterwards (a rewrite must not let it fall back to 777).
+    # A folder whose new files inherit project 777, holding one that inherited it (rewritten,
+    # keeping 777) and one moved to 888 afterwards. ZFS and Linux refuse to rename a file into a +P
+    # folder unless it has the folder's ID, so a copy can never take own-id.bin's place: rebalance
+    # skips it and leaves it untouched with 888.
     chattr("+P", "-p", "777", f"{fl}/projdir")
     write_random(f"{fl}/projdir/inherits.bin", 100_000)
     write_random(f"{fl}/projdir/own-id.bin", 100_000)
     chattr("-p", "888", f"{fl}/projdir/own-id.bin")
+    skip.append("flags/projdir/own-id.bin")
     for name, flag in [("immutable.bin", "+i"), ("appendonly.bin", "+a")]:
         write_random(f"{fl}/{name}", 100_000)
         later.append(lambda p=f"{fl}/{name}", f=flag: chattr(f, p))
         skip.append(f"flags/{name}")
+    make_xattr_files(fl)
 
     # DOS attributes exist only on ZFS (OpenZFS 2.2+ on Linux); elsewhere they're simply not made.
     probe = f"{fl}/dos-hidden.bin"
@@ -126,6 +142,31 @@ def make_flag_files(root, skip):
             later.append(lambda p=p, f=flags: ioctl_u64(p, ZFS_IOC_SETDOSFLAGS, f))
         skip.append("flags/dos-nounlink.bin")
     return later
+
+
+def make_xattr_files(fl):
+    """A file with a capability, as `setcap cap_net_raw=ep` sets it, and one with a trusted.* xattr,
+    which only root can see or set. A root run must rewrite both and keep those xattrs."""
+    cap = f"{fl}/capability.bin"
+    write_random(cap, 100_000)
+    os.chmod(cap, 0o755)
+    try:
+        if shutil.which("setcap"):
+            subprocess.run(["setcap", "cap_net_raw=ep", cap], check=True)
+        else:
+            os.setxattr(cap, "security.capability", capability_xattr(CAP_NET_RAW), follow_symlinks=False)
+    except (OSError, subprocess.CalledProcessError) as e:
+        print(f"note: couldn't give {cap} a capability ({e})")
+
+    trusted = f"{fl}/trusted.bin"
+    write_random(trusted, 100_000)
+    if os.geteuid() != 0:
+        print(f"note: only root can set trusted.* xattrs, so {trusted} has none")
+        return
+    try:
+        os.setxattr(trusted, "trusted.lab", b"only root can see this", follow_symlinks=False)
+    except OSError as e:
+        print(f"note: couldn't give {trusted} a trusted.* xattr ({e.strerror})")
 
 
 def clear_flags(root):

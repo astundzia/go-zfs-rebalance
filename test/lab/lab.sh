@@ -85,7 +85,7 @@ $keys
   - name: bob
     shell: /bin/bash
 package_update: true
-packages: [zfsutils-linux, attr, acl, tmux, python3, jq]
+packages: [zfsutils-linux, attr, acl, libcap2-bin, tmux, python3, jq]
 runcmd:
   - [touch, /var/lib/cloud/lab-ready]
 EOF

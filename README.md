@@ -122,7 +122,9 @@ can't be rewritten is skipped or listed as failed, and is always left exactly as
 Press **Ctrl+C** once, and it finishes the files it's working on, then stops. Press it again (a
 second or more later) to stop right away. Either way is safe: a file is only swapped once its new
 copy is complete and checked, and a half-made copy is simply deleted. If it ever seems stuck, a
-third Ctrl+C quits at once; any half-made copy left behind is cleaned up by the next run.
+third Ctrl+C quits at once, without tidying up. Your files are still safe, but the next run has to
+remove any half-made copy, and the folders it was working in may keep a new modified time (see
+[Safety details and limits](#safety-details-and-limits)).
 
 ```
 3:16:12 PM  ! Stopping after the files in progress… press Ctrl+C again to stop right away (still safe)
@@ -174,8 +176,9 @@ It's built to be. Each file is copied to a new hidden file in the same folder. T
 back and checked, given the same owner, permissions, attributes and times as the original, and
 only then swapped in, in a single step. The original isn't changed or removed before that swap.
 If anything goes wrong (an error, a power cut, Ctrl+C), the original stays as it was. If a file
-changes while it's being copied, it's skipped. The hidden copy gets the original's owner and ACL
-before any data goes into it, so nobody can read it who couldn't read the original.
+changes while it's being copied, it's skipped, and so is a file that another `rebalance` run (or a
+program using `flock`) has locked. The hidden copy gets the original's owner and ACL before any data goes into it,
+so nobody can read it who couldn't read the original.
 
 Still, no tool is perfect. Keep a backup, and read [Safety details and limits](#safety-details-and-limits)
 for the few things it can't protect against.
@@ -187,7 +190,9 @@ No. The owner, group, permissions (including setuid and setgid), extended attrib
 copied, then checked before the swap. On Linux, so are file flags such as nodump (`chattr +d`),
 ZFS project IDs, and the DOS attributes that SMB shares use (hidden, archive, read-only and so
 on). If any of them can't be copied exactly, the file is skipped: it's left exactly as it was,
-the summary at the end counts it, and the exit code stays 0.
+the summary at the end counts it, and the exit code stays 0. (One case is always skipped: a file
+whose project ID is different from its folder's, in a folder set with `chattr +P`. ZFS won't let
+a copy take its place. See [Safety details and limits](#safety-details-and-limits).)
 
 Run it with `sudo`. Only root can give a file someone else's owner. Without `sudo`, it only
 rewrites your own files: files owned by someone else, or whose group you're not in, are skipped
@@ -208,7 +213,8 @@ The common reasons:
 - **ZFS is still freeing space** in the background. Run `--report` again in a few minutes.
 - **Only that folder was rewritten.** Data in other datasets or folders on the pool hasn't moved.
 - **Some files were skipped.** The summary at the end says how many, and why (for example
-  hardlinked files, or files owned by other users when it wasn't run with `sudo`).
+  hardlinked files, or files owned by other users when it wasn't run with `sudo`). See
+  [Why were some files skipped?](#why-were-some-files-skipped)
 - **ZFS doesn't aim for perfectly equal.** It favours emptier vdevs when it writes, so the gap
   shrinks a lot, but rarely to exactly 0. A second pass (`--resume --passes 2`) can narrow it
   further.
@@ -232,7 +238,8 @@ It's worth planning for: for example, rebalance just before a full backup.
 
 A hardlinked file is one file with several names. They're skipped by default, and the summary
 tells you how many there were. Add `--process-hardlinks` to include them: the file is copied once,
-and every name is switched over to the new copy, so they stay linked together.
+and every name is switched over to the new copy, so they stay linked together. Its line in the
+log lists its other names too (up to three, then how many more).
 
 If some of a file's names are outside the folder you gave, it's left alone, because rewriting only
 some of its names would split it into two separate copies. Each of its names in the folder is
@@ -248,7 +255,7 @@ shows an estimate, and you can stop and resume at any time.
 
 | You see | What it means | What to do |
 |---|---|---|
-| Not running as root | Only your own files will be rewritten. Files owned by other users, or that you aren't allowed to replace, are skipped before anything is copied, and never changed. | Run it with `sudo`. |
+| Not running as root | Only your own files will be rewritten. Files owned by other users, in a group you're not in, or that you aren't allowed to replace, are skipped before anything is copied, and never changed. | Run it with `sudo`. |
 | This folder isn't on ZFS | Rewriting files won't rebalance anything. | Check the folder. On TrueNAS, pools are under `/mnt`. |
 | The folder is on ZFS, but the zfs tools aren't available | Files can still be rewritten, but the snapshot and dedup checks and the tables are skipped. | Make sure `zfs` and `zpool` are installed and on the command search path. |
 | This dataset has snapshots | Every rewritten file is stored twice until those snapshots are gone. | Watch your free space, or delete snapshots you don't need first. |
@@ -262,6 +269,38 @@ shows an estimate, and you can stop and resume at any time.
 Every check is a warning, not a stop: the run carries on either way. If you'd rather sort
 something out first, press Ctrl+C. It stops safely, and you can start again whenever you're
 ready.
+
+### Why were some files skipped?
+
+A skipped file is always left exactly as it was, and skipping doesn't change the exit code. The
+summary at the end counts skipped files by reason, such as
+`Skipped 12 files: 8 already done, 4 hardlinked.` Most of them also get a `! skipped` line in the
+log that names the file and says why, and `--debug` shows every one.
+
+| Reason | What it means | What to do |
+|---|---|---|
+| Already done | Rewritten by an earlier run, and you added `--resume`. | Nothing. |
+| Hardlinked | One file with several names. | Add `--process-hardlinks`. |
+| Hardlinks outside the folder | Some of the file's names are outside the folder you gave. | Point it at a folder that holds all the names. |
+| Leftover .balance file | May be the only copy of a file, left by version 1. | See [the .balance question](#i-used-version-1-what-are-these-balance-files). |
+| Owned by someone else | Without `sudo`, only your own files are rewritten. | Run it with `sudo`. |
+| In a group you're not in | Your file, but its group is one you're not in, and only root can give the copy that group. | Run it with `sudo`. |
+| You aren't allowed to replace it | Without `sudo`, you can't read it, or can't change its folder. | Run it with `sudo`. |
+| Owner can't be kept | Even root couldn't give the copy the file's owner, for example on an idmapped mount or a share that maps root to another user. | Run it where root can set owners, such as on the server itself. |
+| Permissions can't be kept exactly | The copy couldn't get exactly the same permissions, ACL, attributes or times. For example, on a TrueNAS SMB share, a setuid or setgid file with ACL entries of its own. | Nothing, unless you want to remove the setuid bit or the extra ACL entries. |
+| Project ID different from its folder's | Its folder is set with `chattr +P`, and ZFS won't let a copy take its place unless it has the folder's project ID (see [Safety details and limits](#safety-details-and-limits)). | Nothing. It's a ZFS rule, and the file keeps its own ID. |
+| Immutable or append-only | Marked with `chattr +i` or `+a` (or the ZFS equivalents, or `chflags uchg` or `uappnd` on macOS), so it can't be replaced. | To include it, remove the mark (`chattr -i`), run again, then put the mark back. |
+| Protected from deletion | Has ZFS's nounlink attribute (or `chflags sunlnk` on macOS), so it can't be replaced. | Nothing. |
+| Over quota | Its owner or group has reached their quota, though the dataset still has room. | Raise the quota or free some space, then run again with `--resume`. |
+| Busy | Another `rebalance` run, or a program using `flock` locks, was working on it. | Run again with `--resume` later. |
+| Changed while copying | Something wrote to it while it was being copied, so the copy was thrown away. | Run again with `--resume` once that program has finished. |
+| Missing | It was deleted or renamed after the folder was scanned. | Nothing. |
+| Couldn't be read | A folder it couldn't look inside, or a file whose details it couldn't read. The log names it. | Check its permissions. |
+
+`--resume` only passes over the files that are already done, so it tries the skipped ones again,
+in case the reason has gone away (for example, you cleared an immutable mark). If they're all
+that's left and they're skipped again for a reason that lasts (such as an immutable mark, another
+owner or a project ID), the summary says that nothing new was rebalanced, and why.
 
 ### What do the exit codes mean?
 
@@ -543,7 +582,10 @@ How it's used:
   a warning saying how much was cleared), and every file is rewritten once. If a `--db` file held
   progress for a different folder, the warning names that folder.
 - **With `--resume`**, files that are already done are skipped, so an interrupted run carries on
-  where it stopped. Once everything is done, `--resume` simply says there's nothing to rebalance.
+  where it stopped. Files that were skipped (for example immutable ones) aren't done, so they're
+  tried again, in case the reason has gone away. Once everything is done, `--resume` simply says
+  there's nothing to rebalance. If the only files left are skipped again for a reason that lasts
+  (such as an immutable mark or another owner), it says that nothing new was rebalanced, and why.
 - **`--passes N`** is the most times a file is rewritten in total, across resumed runs. One run
   never rewrites a file twice. With the default of 1, `--resume` finishes off a run. To rewrite
   everything a second time, use `--resume --passes 2`. Most people never need that.
@@ -551,8 +593,9 @@ How it's used:
 The same folder also holds `run.lock`, which makes sure only one `rebalance` using that folder runs
 at a time. (With `--db`, the lock sits next to that file instead.) Runs that keep their progress
 somewhere else, such as another user's runs or ones with a different `--db`, aren't stopped by it,
-but they still can't trip over each other's files: a temporary copy that another run is still
-working on is never removed. It's safe to delete these files once you're done.
+but they still can't trip over each other's files: a file that another run is working on is
+skipped as busy, and a temporary copy that another run is still using is never removed. It's safe
+to delete these files once you're done.
 
 ### How it works
 
@@ -568,13 +611,16 @@ For each file, `rebalance`:
 3. **Checks the copy**: makes sure it's on disk, reads it back, and compares its checksum with the
    original's.
 4. **Copies everything else**: the other extended attributes, setuid and setgid (only now that the
-   owner is right), file flags such as nodump, the ZFS project ID and DOS attributes, the ACL on
-   macOS, and last of all the access and modified times. Then it checks that they all match the
-   original.
+   owner is right), file flags such as nodump, the ZFS project ID and DOS attributes, the access
+   and modified times, and, on macOS, the ACL last of all (so a "deny" entry in it can't block the
+   earlier steps). Then it checks that they all match the original.
 5. **Makes sure nothing changed**: if the original was modified, replaced or moved while it was
-   being copied, the copy is thrown away and the file is skipped.
+   being copied, the copy is thrown away and the file is skipped. (While it works on a file, it
+   also holds an `flock` lock on it, so if another `rebalance` run already has the file, it's
+   skipped as busy before anything is copied.)
 6. **Swaps it in**, in one step: the copy is renamed over the original. At every moment, the name
-   points to either the complete original or the complete, checked copy.
+   points to either the complete original or the complete, checked copy. If something read the
+   hidden copy just before the swap and so changed its access time, the time is put back.
 7. **Records it** in the progress file. Once a folder's files are done, its own modified time is
    put back, so tools that watch folder times don't rescan everything. If something else changed
    the folder in the meantime, its new time is left alone. If a time can't be put back, a warning
@@ -596,9 +642,13 @@ recordsize.
   copies the data itself so that can't happen. During a `--vdev-report` run, the pool's block
   cloning counter is checked every 10 seconds, and a note says so if it ever grows.
 - **Files that are open for writing.** If a program changes a file while it's being copied, the
-  file is skipped. But a program that already has the file open can still write to the old copy
-  just after the swap, and that write would be lost. So stop apps that write to the folder (VMs,
-  databases, download clients) while it runs.
+  file is skipped. A file that another `rebalance` run has locked is skipped as busy and left
+  alone, and so is one a program has locked with `flock` (on macOS, other kinds of file lock count
+  too). But on Linux, the byte-range locks that databases and Samba use aren't seen, and most
+  programs don't lock the files they use at all, and a program that
+  already has the file open can still write to the old copy just after the swap, and that write
+  would be lost. So stop apps that write to the folder (VMs, databases, download clients) while
+  it runs.
 - **New inode numbers and change times.** Every rewritten file gets them, and a new creation time.
   Backup tools and incremental `zfs send` will see the files as changed (see
   [the FAQ](#why-does-my-backup-tool-or-zfs-send-think-everything-changed)). Modified times are
@@ -607,8 +657,15 @@ recordsize.
   [the FAQ](#what-do-the-warnings-at-the-start-mean).
 - **File flags.** On Linux, flags such as nodump (`chattr +d`), ZFS project IDs and ZFS DOS
   attributes are kept. Immutable and append-only files (`chattr +i` / `+a`, or the ZFS
-  equivalents) can't be replaced, so they're skipped and left exactly as they were. On macOS,
-  flags set with `chflags` (such as `hidden`) aren't kept.
+  equivalents), and files protected from deletion by ZFS's nounlink attribute, can't be replaced,
+  so they're skipped and left exactly as they were. On macOS, files marked with `chflags uchg`,
+  `uappnd` or `sunlnk` are skipped the same way, and other `chflags` flags (such as `hidden`)
+  aren't kept.
+- **Project IDs in `chattr +P` folders.** A folder set with `chattr +P` gives its project ID to
+  every new file in it, and ZFS refuses to move a file with a different ID into it. So a file
+  whose project ID is different from its folder's can't be swapped for a copy. It's skipped, with
+  that reason in the log and the summary, and left untouched, still with its own ID. Files with
+  the folder's ID, the usual case, are rewritten as normal.
 - **Permissions that can't be kept exactly.** On TrueNAS SMB shares (`aclmode=restricted`), a
   setuid or setgid file that also has ACL entries of its own can't get those bits back on a new
   copy, so it's skipped and left untouched. Like every skipped file, it doesn't change the exit
@@ -616,17 +673,20 @@ recordsize.
 - **Without `sudo`**, only your own files are rewritten: ones you own, with a group you're in.
   Everything else is skipped before anything is copied.
 - **`trusted.*` extended attributes** (used by a few system tools, such as overlayfs) are only
-  visible to root. If your files have them, run it with `sudo`.
+  visible to root. If your files have them, run it with `sudo`. File capabilities (set with
+  `setcap`) are kept too, when run with `sudo`.
 - **Hardlinks.** A hardlinked file with names outside the folder is skipped, and its names are
-  listed in the log. If a run is stopped hard (a second Ctrl+C or a power cut) while it's
-  switching a hardlinked file's names over to the new copy, those names may end up as separate,
-  identical copies instead of links to one file. No data is lost.
-- **After a hard kill** (`kill -9`) or a power cut, the folders it was working in may keep a new
-  modified time. Nothing else changes, and the next run removes any leftover temporary files. A
-  second Ctrl+C doesn't have this problem.
+  listed in the log. Once it starts switching a hardlinked file's names over to the new copy, one
+  or two Ctrl+Cs let it finish. Only a third Ctrl+C, `kill -9` or a power cut at that moment can
+  leave those names as separate, identical copies instead of links to one file. No data is lost.
+- **After a third Ctrl+C, `kill -9` or a power cut**, the folders it was working in may keep a new
+  modified time, because it quits without tidying up. Nothing else changes, and the next run
+  removes any leftover temporary files. One or two Ctrl+Cs don't have this problem.
 - **Running out of space.** If the pool or the dataset is full, the run stops (exit code 3) rather
-  than failing every file after it. If a user or group quota is reached while the dataset still
-  has room, only that owner's files are skipped, and the run carries on.
+  than failing every file after it. It still puts folder times back, trying again for a few
+  seconds if ZFS hasn't yet freed the space of the copies it threw away. If a user or group quota
+  is reached while the dataset still has room, only that owner's files are skipped, and the run
+  carries on.
 - **It stays inside the folder.** It never follows a symlink out of it, and only ever removes its
   own temporary files (`.zfs-rebalance.<12 hex digits>.tmp`), and never one that another run is
   still using.
@@ -637,7 +697,7 @@ recordsize.
 
 | Code | Meaning |
 |---|---|
-| `0` | Finished. Files that were skipped (such as hardlinked or immutable ones, other users' files without `sudo`, or ones whose permissions can't be kept exactly) don't change this. |
+| `0` | Finished. Files that were skipped (such as hardlinked, immutable or busy ones, other users' files without `sudo`, or ones whose permissions can't be kept exactly) don't change this. |
 | `1` | Some files couldn't be rewritten, and each was left as it was. Or the folder couldn't be read. |
 | `2` | Didn't start, so nothing was changed. For example: a mistake in the options, the folder doesn't exist, another run is in progress, a problem with the progress file, an unsupported system, or `--report` on a folder that isn't on ZFS. |
 | `3` | Stopped early: a file went missing (with `--halt-on-missing`), or the pool or dataset ran out of space. |
@@ -672,6 +732,12 @@ for pkg in fileutil rebalance; do
 done
 ```
 
+The tests work in the system's temporary folder. To test ZFS-only behaviour too (DOS attributes,
+NFSv4 ACLs, project IDs), set `REBALANCE_TEST_DIR` to a folder on a ZFS dataset, for example
+`REBALANCE_TEST_DIR=/mnt/tank/gotest`. Tests that run a program they make put it there too, and
+skip themselves if the folder they'd use can't run programs (a filesystem mounted `noexec`, such
+as `/tmp` on TrueNAS).
+
 Every push and pull request is checked on GitHub Actions: vet, staticcheck and the race-enabled
 tests on Ubuntu and macOS; the root-only tests, as root on Ubuntu (the job fails unless at least
 one of them really ran as root); and installer tests on Ubuntu and macOS against locally served
@@ -684,8 +750,8 @@ slow and real:
 
 | Layer | Where | What it proves |
 |---|---|---|
-| **Unit tests** | `go test -race ./...`, on every push (Ubuntu and macOS) | The safe-swap steps one at a time: copies match byte for byte; the empty copy gets its owner and ACL before any data; owners, modes, times, xattrs and ACLs carry over; nothing is left behind when a copy is cancelled or fails, and the original's access time is unchanged; a file that changes mid-copy is left alone; symlinks and pipes planted where the temporary file goes are never followed; a temporary file another run is using is never removed; the copy can't take the block-cloning shortcut; a full quota is told apart from a full pool; other users' files are skipped up front without `sudo`; folder times are only put back when nothing else changed them |
-| **Root-only tests** | CI, as root on Ubuntu (the job fails unless at least one really ran as root) | Ownership and setuid bits are kept for files owned by someone else; inode flags (such as nodump) and project IDs are kept; immutable and append-only files are skipped and left alone |
+| **Unit tests** | `go test -race ./...`, on every push (Ubuntu and macOS) | The safe-swap steps one at a time: copies match byte for byte; the empty copy gets its owner and ACL before any data; owners, modes, times, xattrs and ACLs carry over; nothing is left behind when a copy is cancelled or fails, and the original's access time is unchanged; a file that changes mid-copy is left alone, and so is one another program has locked; symlinks and pipes planted where the temporary file goes are never followed; a temporary file another run is using is never removed; the copy can't take the block-cloning shortcut; a full quota is told apart from a full pool; other users' files are skipped up front without `sudo`; folder times are only put back when nothing else changed them |
+| **Root-only tests** | CI, as root on Ubuntu (the job fails unless at least one really ran as root) | Ownership and setuid bits are kept for files owned by someone else; inode flags (such as nodump), file capabilities and project IDs are kept; a file whose project ID its `chattr +P` folder won't take, and immutable and append-only files, are skipped and left alone. The project-ID and ZFS-only tests need `REBALANCE_TEST_DIR` on ZFS, so they run in the lab |
 | **Whole-program tests** | `cmd/rebalance` tests, on every push | Options (including after the folder), exit codes, Ctrl+C timing, a closed output pipe and `--resume`, the run lock, where progress is saved under `sudo`, refusing a `--db` file that isn't a progress file, friendly messages and hints, escaping of strange file names, and the report tables against real `zpool list` output |
 | **Installer tests** | CI, on Ubuntu and macOS | The one-line install as root, and without root (it shows the exact command to run); folders mounted `noexec` noticed before anything runs or is created; a program that won't start; an install cut short by a closed output pipe; leftovers of an earlier install cleaned up; the TrueNAS and macOS default folders; a bad checksum is refused |
 | **Real-ZFS lab** | Before each release, on two VMs | Everything above on real pools: a Linux VM with OpenZFS 2.2 and a TrueNAS SCALE 25.10 VM with OpenZFS 2.3 |
@@ -697,12 +763,13 @@ content, owner, mode, timestamps, xattrs and ACLs are identical afterwards, and 
 new inode. The new inode is proof it was really written again. The pool's block-clone counter must
 not move, and the spread between vdevs has to drop. The lab also checks stopping and resuming
 (including a closed output pipe), hardlinks, running out of space and quotas, files changing
-mid-copy, snapshots, runs without `sudo`, file flags, project IDs and immutable files, two runs at
-once, tmux on TrueNAS, the installer on TrueNAS's `noexec` `/home`, reboots on TrueNAS, and a
-side-by-side run of version 1 to confirm its bugs are gone.
+mid-copy or locked by another program, snapshots, runs without `sudo`, file flags, capabilities,
+project IDs and immutable files, two runs at once, tmux on TrueNAS, the installer on TrueNAS's
+`noexec` `/home`, reboots on TrueNAS, and a side-by-side run of version 1 to confirm its bugs are
+gone.
 
-The full test plan, the scripts, and how to build the lab yourself on any Linux machine with KVM
-are in [test/lab/README.md](test/lab/README.md).
+The full test plan, the scripts, the latest results, and how to build the lab yourself on any
+Linux machine with KVM are in [test/lab/README.md](test/lab/README.md).
 
 ### Releasing
 

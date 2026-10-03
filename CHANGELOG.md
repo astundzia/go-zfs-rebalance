@@ -63,27 +63,41 @@ nothing at all. All of that is fixed. If you use version 1, please upgrade.
   take, so sparse files don't set it off), `.balance` leftovers from version 1, and kept temporary
   files.
 - Hardlinked files can be rewritten together with `--process-hardlinks`. A hardlinked file with
-  names outside the folder is left alone, and its names are listed in the log.
+  names outside the folder is left alone, and its names are listed in the log. The log line for a
+  rewritten hardlinked file lists its other names (up to three, then how many more).
 - A progress line every minute, with an estimate of the time left, and a summary at the end that
   says what to do next.
 - Only one run at a time per progress folder, and a run never removes a temporary file that
   another run is still using.
-- Runs without `sudo` only rewrite your own files. Files owned by someone else, or that you
-  aren't allowed to replace, are skipped before anything is copied, and the summary says how to
-  include them.
-- Immutable and append-only files (`chattr +i` / `+a`, or the ZFS equivalents) are skipped and
-  left alone.
+- A file that another `rebalance` run (or a program using `flock`) has locked is skipped as busy and
+  left alone. So two runs on the same folder (with different `--db` files) never copy the same file at
+  the same time.
+- Runs without `sudo` only rewrite your own files. Files owned by someone else, in a group you're
+  not in, or that you aren't allowed to replace, are skipped before anything is copied, and the
+  summary says how to include them.
+- Immutable and append-only files (`chattr +i` / `+a`, or the ZFS equivalents), and files
+  protected from deletion by ZFS's nounlink attribute, are skipped and left alone.
+- A file whose project ID is different from that of its `chattr +P` folder is skipped and left
+  untouched, because ZFS won't let a copy take its place.
+- The summary names each kind of skipped file plainly: owned by someone else, in a group you're
+  not in, owner can't be kept, permissions can't be kept exactly, project ID different from its
+  folder's, immutable or append-only, protected from deletion, over quota, busy, and so on.
+- `--resume` tries skipped files again, in case the reason has gone away. If those are the only
+  files left and they're skipped again for a reason that lasts, it says plainly that nothing new
+  was rebalanced, and why.
 - When a user or group quota is reached, only that owner's files are skipped and the run carries
   on. A full pool or dataset still stops the run.
 - Stopping is gentler and clearer: a second Ctrl+C only stops right away if it comes a second or
-  more after the first, a third quits at once, and the messages say what is being stopped
-  (scanning, copying, or waiting for ZFS). Output piped into a program that quits early, such as
-  `head`, stops the run gently.
+  more after the first, a third quits at once (without tidying up, like `kill -9`), and the
+  messages say what is being stopped (scanning, copying, or waiting for ZFS). Output piped into a
+  program that quits early, such as `head`, stops the run gently, with exit code 130.
 - On TrueNAS, if `zfs` and `zpool` can't be started because the `sudo` session that started the
-  run has ended, a friendly message explains it (start tmux without `sudo`, then run
-  `sudo rebalance` inside it) instead of a raw error.
+  run has ended, a friendly message explains it once (start tmux without `sudo`, then run
+  `sudo rebalance` inside it) instead of a raw error. That includes the block-cloning check during
+  the run, and it no longer says it's waiting for ZFS to free space when it can't.
 - If you save the output to a file inside the folder being rebalanced, that file is left alone.
-- An unknown option that looks like a folder name starting with `-` gets a hint to put `--` before
+- A bad option value gets a plain message, such as "--concurrency needs a whole number, like 4".
+  An unknown option that looks like a folder name starting with `-` gets a hint to put `--` before
   it.
 - `install.sh`, a one-line installer (`curl … | sudo bash`, see the README). It checks the
   download's checksum and that the folder can run programs, and on TrueNAS installs into
@@ -108,8 +122,9 @@ nothing at all. All of that is fixed. If you use version 1, please upgrade.
   writes new blocks.
 - **Owners, extended attributes, ACLs and access times were lost.** Run as root, every file became
   owned by root and lost its ACL, even though the docs said they were kept. They are now copied,
-  then checked before the swap. On Linux, a file that's skipped or fails also keeps its access
-  time, because the original is read without updating it.
+  then checked before the swap, and if something reads the hidden copy just before the swap, its
+  access time is put back afterwards. On Linux, a file that's skipped or fails also keeps its
+  access time, because the original is read without updating it.
 - Changes made to a file while it was being copied were lost. They are now noticed, and the file
   is skipped.
 - When a file couldn't be rescued after an error, the program still said it had been saved.
@@ -144,9 +159,10 @@ nothing at all. All of that is fixed. If you use version 1, please upgrade.
 - Log lines mangled file names containing " at " or ":", and dropped the reason for errors.
 - Colour codes were written even when the output wasn't a terminal.
 - Every folder's modified time changed. Now each folder gets its times back once its files are
-  done, so tools that watch folder times don't rescan everything. A folder that something else
-  changed in the meantime keeps its new time, and if a time can't be put back, the summary says
-  so.
+  done, so tools that watch folder times don't rescan everything. After a quota stop it keeps
+  trying for a few seconds while ZFS frees space. A folder that something else changed in the meantime keeps its new
+  time, even if that change came in the same clock tick as one of the run's own. If a time can't
+  be put back, the summary says so.
 - The README's macOS checksum steps didn't work.
 - Skip counts in the summary now read properly ("1 leftover .balance file", "2 leftover .balance
   files").
@@ -159,7 +175,9 @@ nothing at all. All of that is fixed. If you use version 1, please upgrade.
 - **Symlink and FIFO tricks on the temporary file.** A symlink placed at `<name>.balance` was
   followed, so a root run could overwrite any file it pointed to. Temporary files now have random
   names, are created only if nothing is there, never follow symlinks, and must be regular files.
-  All file access stays inside the folder being rebalanced.
+  Their owner, permissions and times are set through the open file, never by name, so a symlink
+  put in a temporary file's place can't redirect them. All file access stays inside the folder
+  being rebalanced.
 - **The temporary copy could be read by others.** It now gets the original's owner, ACL and
   permissions before any data is written into it, so nobody can read it who couldn't read the
   original.

@@ -2,7 +2,7 @@
 """Snapshot and compare a directory tree for the rebalance e2e tests (run as root).
 
   manifest.py snap <root> <out.json>
-  manifest.py diff <before.json> <after.json> [--expect-rewritten] [--allow-missing PATH ...]
+  manifest.py diff <before.json> <after.json> [--expect-rewritten] [--skip-file FILE]
 
 A snapshot records, per entry: type, size, sha256 (regular files), mode, uid, gid, atime_ns, mtime_ns,
 nlink, inode, symlink target, every xattr (including system.* ACL xattrs such as system.nfs4_acl_xdr and
@@ -10,10 +10,16 @@ system.posix_acl_access; trusted.* ones are only visible to root) and, for direc
 it also records each file's and folder's inode flags (chattr: nodump, immutable, ...), project ID and
 xflags, and ZFS DOS attributes, where the filesystem has them. It also lists leftover rebalance temp files.
 
+Taking a snapshot changes nothing. On Linux, files are read with O_NOATIME (allowed for root and for a
+file's owner), so their access times don't move. Where that isn't allowed, a changed access time is put
+back with utime; if the system refuses that too (immutable and append-only files, or a dataset at its
+quota), a warning names the file, since the next snapshot will show its access time changed.
+
 diff exits 0 only if content and all metadata are identical. With --expect-rewritten it also requires that
 every regular file got a new inode (proof that it was physically rewritten), except files listed in the
 "skipped" set (hardlinks etc.) passed through --skip-file.
 """
+import errno
 import fcntl
 import hashlib
 import json
@@ -33,6 +39,12 @@ ZFS_IOC_GETDOSFLAGS = 0x80088301  # OpenZFS include/sys/fs/zfs.h: _IOR(0x83, 1, 
 # bookkeeping bits (such as AV_MODIFIED, set by every write) that aren't part of the file's
 # attributes.
 ZFS_DOS_USER_VISIBLE = 0x38FF00000000
+
+# Linux only: read without updating the access time. Allowed for root (CAP_FOWNER) and the owner.
+O_NOATIME = getattr(os, "O_NOATIME", 0)
+# Why utime can refuse to put an access time back: immutable or append-only files (EPERM), a
+# dataset at its quota or a full pool (EDQUOT, ENOSPC), or a read-only filesystem (EROFS).
+UTIME_REFUSED = {errno.EPERM, errno.EACCES, errno.EDQUOT, errno.ENOSPC, errno.EROFS}
 
 
 def xattrs(path):
@@ -78,12 +90,43 @@ def inode_attrs(path):
     return out
 
 
+def open_quietly(path):
+    """Opens path for reading. Returns the descriptor and whether reading through it leaves the
+    access time alone (O_NOATIME), which Linux only allows for root and the file's owner."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    if O_NOATIME:
+        try:
+            return os.open(path, flags | O_NOATIME), True
+        except PermissionError:
+            pass
+    return os.open(path, flags), False
+
+
 def sha256(path):
+    """Returns the file's sha256 and whether reading it left its access time alone."""
+    fd, quiet = open_quietly(path)
     h = hashlib.sha256()
-    with open(path, "rb") as f:
+    with os.fdopen(fd, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
-    return h.hexdigest()
+    return h.hexdigest(), quiet
+
+
+def restore_atime(path, before):
+    """Puts back path's access time if reading it changed it. Returns False, after a warning, if
+    the system refused (see UTIME_REFUSED)."""
+    now = os.lstat(path)
+    if now.st_atime_ns == before.st_atime_ns:
+        return True
+    try:
+        os.utime(path, ns=(before.st_atime_ns, now.st_mtime_ns), follow_symlinks=False)
+        return True
+    except OSError as e:
+        if e.errno not in UTIME_REFUSED:
+            raise
+        print(f"warning: couldn't put back the access time of {path!r} ({e.strerror}); "
+              "take snapshots as root so files are read without changing it", file=sys.stderr)
+        return False
 
 
 def snap(root):
@@ -105,11 +148,13 @@ def snap(root):
             if stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode):
                 e.update(inode_attrs(p))
             if stat.S_ISREG(st.st_mode):
-                e.update(type="file", size=st.st_size, sha256=sha256(p), atime_ns=st.st_atime_ns,
+                digest, quiet = sha256(p)
+                e.update(type="file", size=st.st_size, sha256=digest, atime_ns=st.st_atime_ns,
                          blocks=st.st_blocks)
-                # Hashing reads the file, which can bump atime; put it back so the snapshot doesn't
+                # A read without O_NOATIME can bump atime; put it back so the snapshot doesn't
                 # perturb what the next run (and the next snapshot) sees.
-                os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=False)
+                if not quiet:
+                    restore_atime(p, st)
             elif stat.S_ISDIR(st.st_mode):
                 e.update(type="dir")
             elif stat.S_ISLNK(st.st_mode):
