@@ -624,6 +624,31 @@ Every push and pull request is checked on GitHub Actions: vet, staticcheck and t
 tests on Ubuntu and macOS, the root-only tests, and a full install test of `install.sh` against
 locally served release files.
 
+### How it's tested
+
+This tool rewrites every file you point it at, so it's tested in layers, from small and fast to
+slow and real:
+
+| Layer | Where | What it proves |
+|---|---|---|
+| **Unit tests** | `go test -race ./...`, on every push (Ubuntu and macOS) | The safe-swap steps one at a time: copies match byte for byte; owners, modes, times, xattrs and ACLs carry over; nothing is left behind when a copy is cancelled or fails; a file that changes mid-copy is left alone; symlinks and pipes planted where the temporary file goes are never followed; the copy can't take the block-cloning shortcut |
+| **Root-only tests** | CI, as root on Ubuntu | Ownership and setuid bits are kept for files owned by someone else |
+| **Whole-program tests** | `cmd/rebalance` tests, on every push | Options (including after the folder), exit codes, Ctrl+C and `--resume`, the run lock, friendly messages, escaping of strange file names, and the report tables against real `zpool list` output |
+| **Installer test** | CI | The one-line install, as root and not, against locally served release files; a bad checksum is refused |
+| **Real-ZFS lab** | Before each release, on two VMs | Everything above on real pools: a Linux VM with OpenZFS 2.2 and a TrueNAS SCALE 25.10 VM with OpenZFS 2.3 |
+
+In the lab, each pool starts as one vdev about half full of deliberately awkward test data. A
+second, empty vdev is added, and the tool is run the way a person would: installed with the
+one-liner, then `--report`, then `--vdev-report`. A run only counts as a pass if every file's
+content, owner, mode, timestamps, xattrs and ACLs are identical afterwards, and every file has a
+new inode. The new inode is proof it was really written again. The pool's block-clone counter must
+not move, and the spread between vdevs has to drop. The lab also checks stopping and resuming, hardlinks,
+running out of space, files changing mid-copy, snapshots, reboots on TrueNAS, and a side-by-side
+run of version 1 to confirm its bugs are gone.
+
+The full test plan, the scripts, and how to build the lab yourself on any Linux machine with KVM
+are in [test/lab/README.md](test/lab/README.md).
+
 ### Releasing
 
 1. Add a section for the new version at the top of [CHANGELOG.md](CHANGELOG.md), headed like

@@ -84,8 +84,10 @@ jobs:
           go-version-file: go.mod
       - name: Build the release files
         run: make dist VERSION=ci
-      - name: shellcheck the installer
-        run: shellcheck -s sh install.sh
+      - name: shellcheck the installer and the lab script
+        run: |
+          shellcheck -s sh install.sh
+          shellcheck test/lab/lab.sh
       - name: Serve dist/ on localhost
         run: |
           python3 -m http.server --directory dist --bind 127.0.0.1 8000 >"$RUNNER_TEMP/http.log" 2>&1 &

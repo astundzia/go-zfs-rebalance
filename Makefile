@@ -39,6 +39,7 @@ lint:
 	GOOS=windows $(GO) vet ./...
 	$(GO) run $(STATICCHECK) ./...
 	shellcheck -s sh install.sh
+	shellcheck test/lab/lab.sh
 
 dist:
 	rm -rf dist
