@@ -1,0 +1,141 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # staticcheck 2026.2.1. Keep in sync with STATICCHECK in the Makefile.
+  STATICCHECK: honnef.co/go/tools/cmd/staticcheck@v0.8.1
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: go vet
+        run: go vet ./...
+      - name: go vet (Linux)
+        run: GOOS=linux go vet ./...
+      - name: go vet (Windows, which must still compile)
+        run: GOOS=windows go vet ./...
+      - name: staticcheck
+        run: go run "$STATICCHECK" ./...
+      - name: Tests with the race detector
+        run: go test -race ./...
+
+  root-tests:
+    name: Root-only tests (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      # "sudo go test" trips over PATH and GOCACHE, so build the test binary first
+      # and run only that binary as root.
+      - name: Build the fileutil test binary
+        run: go test -race -c -o "$RUNNER_TEMP/fileutil.test" ./internal/fileutil
+      - name: Run the root-only tests as root
+        working-directory: internal/fileutil
+        run: |
+          sudo "$RUNNER_TEMP/fileutil.test" -test.run Root -test.v -test.count=1 | tee "$RUNNER_TEMP/root-tests.log"
+          # These tests skip themselves when not root, so make sure they really ran.
+          if ! grep -q -- '--- PASS: .*Root' "$RUNNER_TEMP/root-tests.log"; then
+            echo "::error::No root-only test passed."
+            exit 1
+          fi
+
+  installer:
+    name: Release build and installer smoke test (ubuntu)
+    runs-on: ubuntu-latest
+    env:
+      BASE_URL: http://127.0.0.1:8000
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Build the release files
+        run: make dist VERSION=ci
+      - name: shellcheck the installer
+        run: shellcheck -s sh install.sh
+      - name: Serve dist/ on localhost
+        run: |
+          python3 -m http.server --directory dist --bind 127.0.0.1 8000 >"$RUNNER_TEMP/http.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            if curl -fsS -o /dev/null "$BASE_URL/checksums.txt"; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::The local web server didn't start."
+          cat "$RUNNER_TEMP/http.log"
+          exit 1
+      - name: The installer refuses to run without root
+        run: |
+          for shell in sh bash; do
+            if REBALANCE_BASE_URL="$BASE_URL" "$shell" install.sh --dir /tmp/rb-nonroot >"$RUNNER_TEMP/nonroot.log" 2>&1; then
+              echo "::error::install.sh ran without root under $shell."
+              exit 1
+            fi
+            cat "$RUNNER_TEMP/nonroot.log"
+            grep -q 'sudo bash' "$RUNNER_TEMP/nonroot.log"
+          done
+          test ! -e /tmp/rb-nonroot
+      - name: Install as root into a chosen folder
+        run: |
+          sudo REBALANCE_BASE_URL="$BASE_URL" sh install.sh --dir /tmp/rb-bin
+          /tmp/rb-bin/rebalance --version >"$RUNNER_TEMP/version.txt" 2>&1
+          cat "$RUNNER_TEMP/version.txt"
+          grep -qw ci "$RUNNER_TEMP/version.txt"
+      - name: Install with the one-liner into the default folder, then uninstall
+        run: |
+          curl -fsSL "$BASE_URL/install.sh" | sudo REBALANCE_BASE_URL="$BASE_URL" bash
+          /usr/local/bin/rebalance --version >"$RUNNER_TEMP/version.txt" 2>&1
+          grep -qw ci "$RUNNER_TEMP/version.txt"
+          curl -fsSL "$BASE_URL/install.sh" | sudo bash -s -- --uninstall
+          test ! -e /usr/local/bin/rebalance
+      - name: The installer refuses a download that doesn't match its checksum
+        run: |
+          before=$(sha256sum </tmp/rb-bin/rebalance)
+          for f in dist/rebalance-linux-*.sha256; do
+            printf '%064d  %s\n' 0 "$(basename "$f" .sha256)" >"$f"
+          done
+          if sudo REBALANCE_BASE_URL="$BASE_URL" sh install.sh --dir /tmp/rb-bin; then
+            echo "::error::install.sh accepted a download with the wrong checksum."
+            exit 1
+          fi
+          # The copy that was already installed is untouched, and no temp files are left behind.
+          test "$(sha256sum </tmp/rb-bin/rebalance)" = "$before"
+          test -z "$(find /tmp/rb-bin -name '.rebalance.*')"
+      - name: Uninstall from the chosen folder
+        run: |
+          sudo sh install.sh --uninstall --dir /tmp/rb-bin
+          test ! -e /tmp/rb-bin/rebalance
