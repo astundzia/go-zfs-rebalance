@@ -20,10 +20,23 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// testDirEnv names a directory to run the rewrite tests in instead of the system's temporary
+// directory, for example a folder on a ZFS dataset, so that ZFS-only behaviour (DOS attributes,
+// NFSv4 ACLs, project IDs) is tested too.
+const testDirEnv = "REBALANCE_TEST_DIR"
+
 // newRoot returns a fresh directory and an os.Root opened on it.
 func newRoot(t *testing.T) (string, *os.Root) {
 	t.Helper()
-	dir := t.TempDir()
+	var dir string
+	if base := os.Getenv(testDirEnv); base != "" {
+		var err error
+		dir, err = os.MkdirTemp(base, "fileutil-test-")
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	} else {
+		dir = t.TempDir()
+	}
 	root, err := os.OpenRoot(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = root.Close() })
@@ -56,12 +69,48 @@ func requireNoTemps(t *testing.T, dir string) {
 }
 
 // requireUntouched checks that rel is still the same, unmodified inode. Atime is ignored because
-// reading the file may update it.
+// reading the file may update it, and so is the allocated size, which ZFS only settles once its
+// pending writes reach the disks.
 func requireUntouched(t *testing.T, root *os.Root, rel string, before Info) {
 	t.Helper()
 	after := mustLstat(t, root, rel)
-	after.Atime = before.Atime
+	after.Atime, after.Blocks = before.Atime, before.Blocks
 	require.Equal(t, before, after, "%s was changed", rel)
+}
+
+// findTemp returns the name of the one temporary file in dir.
+func findTemp(t *testing.T, dir string) string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	for _, e := range entries {
+		if IsTempName(e.Name()) {
+			return e.Name()
+		}
+	}
+	t.Fatal("no temporary copy found")
+	return ""
+}
+
+func setPrepareHook(t *testing.T, hook func(tmpRel string)) {
+	t.Helper()
+	afterPrepareHook = hook
+	t.Cleanup(func() { afterPrepareHook = nil })
+}
+
+func setNameSwapHook(t *testing.T, hook func(tempRel, name string)) {
+	t.Helper()
+	beforeNameSwapHook = hook
+	t.Cleanup(func() { beforeNameSwapHook = nil })
+}
+
+// setOldAtime gives name an access time far in the past, which Linux's default relatime would
+// move to now as soon as the file is read.
+func setOldAtime(t *testing.T, name string) {
+	t.Helper()
+	fi, err := os.Stat(name)
+	require.NoError(t, err)
+	require.NoError(t, os.Chtimes(name, time.Date(2001, 2, 3, 4, 5, 6, 0, time.UTC), fi.ModTime()))
 }
 
 func requireContent(t *testing.T, name string, want []byte) {

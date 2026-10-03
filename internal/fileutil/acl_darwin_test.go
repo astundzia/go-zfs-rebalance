@@ -4,12 +4,14 @@ package fileutil
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 // addACL adds a macOS ACL entry with chmod(1), skipping the test if the filesystem has no ACLs.
@@ -24,6 +26,14 @@ func addACL(t *testing.T, name, entry string) {
 		dir = filepath.Dir(name)
 	}
 	t.Cleanup(func() { _ = exec.Command("/bin/chmod", "-R", "-N", dir).Run() })
+}
+
+// noexec reports whether dir is on a filesystem mounted noexec.
+func noexec(t *testing.T, dir string) bool {
+	t.Helper()
+	var st unix.Statfs_t
+	require.NoError(t, unix.Statfs(dir, &st))
+	return st.Flags&unix.MNT_NOEXEC != 0
 }
 
 func aclOf(t *testing.T, name string) []byte {
@@ -52,6 +62,12 @@ func TestReplaceInPlaceKeepsMacACL(t *testing.T) {
 	want := aclOf(t, name)
 	require.NotNil(t, want)
 	before := mustLstat(t, root, "f")
+	// Without root, a "deny" entry could block the steps after the copy, so the ACL comes last.
+	early := want
+	if os.Geteuid() != 0 {
+		early = nil
+	}
+	setPrepareHook(t, func(tmpRel string) { require.Equal(t, early, aclOf(t, filepath.Join(dir, tmpRel))) })
 
 	_, err := ReplaceInPlace(context.Background(), root, "f", Options{})
 	require.NoError(t, err)
@@ -89,18 +105,52 @@ func TestReplaceInPlaceMacACLDenyDelete(t *testing.T) {
 }
 
 // A directory's inheritable ACL is applied to the new copy when it is created; the original never
-// had it, so it must be removed again.
+// had it, so it must be removed again, and before any data is written: otherwise everyone the
+// folder lets in could read (or change) a private file's data while it is being copied.
 func TestReplaceInPlaceDropsInheritedMacACL(t *testing.T) {
 	dir, root := newRoot(t)
-	name := filepath.Join(dir, "f")
-	require.NoError(t, os.WriteFile(name, []byte("plain"), 0o644))
+	name := filepath.Join(dir, "secret")
+	require.NoError(t, os.WriteFile(name, []byte("private"), 0o600))
 	require.Nil(t, aclOf(t, name))
-	addACL(t, dir, "everyone allow read,file_inherit")
+	addACL(t, dir, "everyone allow read,write,file_inherit")
 
-	_, err := ReplaceInPlace(context.Background(), root, "f", Options{})
+	prepared := false
+	setPrepareHook(t, func(tmpRel string) {
+		prepared = true
+		tmp := filepath.Join(dir, tmpRel)
+		require.Nil(t, aclOf(t, tmp), "the copy still has the folder's ACL while data is written: %s", listACL(t, tmp))
+	})
+	_, err := ReplaceInPlace(context.Background(), root, "secret", Options{})
 	require.NoError(t, err)
+	require.True(t, prepared)
 
 	require.Nil(t, aclOf(t, name), "the inherited ACL must not stick: %s", listACL(t, name))
+	requireContent(t, name, []byte("private"))
+}
+
+// chflags uchg (or uappnd) stops even root from renaming over a file, so it must be refused before
+// anything is read or copied.
+func TestReplaceInPlaceRefusesImmutable(t *testing.T) {
+	for _, flag := range []int{unix.UF_IMMUTABLE, unix.UF_APPEND} {
+		t.Run(fmt.Sprintf("%#x", flag), func(t *testing.T) {
+			dir, root := newRoot(t)
+			name := filepath.Join(dir, "f")
+			require.NoError(t, os.WriteFile(name, randomBytes(t, 64<<10), 0o644))
+			setOldAtime(t, name)
+			require.NoError(t, unix.Chflags(name, flag))
+			t.Cleanup(func() { _ = unix.Chflags(name, 0) })
+			before := mustLstat(t, root, "f")
+
+			_, err := ReplaceInPlace(context.Background(), root, "f", Options{})
+			require.ErrorIs(t, err, ErrImmutable)
+			require.Equal(t, "it's marked immutable or append-only (chflags uchg / uappnd), so it was left alone — nothing was changed", err.Error())
+
+			after := mustLstat(t, root, "f")
+			require.True(t, before.Atime.Equal(after.Atime), "the file was read before it was refused")
+			requireUntouched(t, root, "f", before)
+			requireNoTemps(t, dir)
+		})
+	}
 }
 
 func TestMacACLRoundTrip(t *testing.T) {

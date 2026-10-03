@@ -21,28 +21,42 @@ func (s *sentinel) Error() string { return s.base + nothingChanged }
 var (
 	// ErrModified means another program changed the file while it was being copied.
 	ErrModified error = &sentinel{"the file changed while it was being copied"}
-	// ErrNoSpace means the pool or a quota ran out of space (ENOSPC or EDQUOT).
+	// ErrNoSpace means the pool or a quota ran out of space. The error also matches the system
+	// error, so errors.Is(err, syscall.EDQUOT) tells a quota (which may belong to the file's owner
+	// or group rather than the whole dataset) apart from a full pool (syscall.ENOSPC).
 	ErrNoSpace error = &sentinel{"not enough free space"}
 	// ErrOwnership means the copy could not be given the original's owner or group.
 	ErrOwnership error = &sentinel{"couldn't keep the file's owner (try running with sudo)"}
-	// ErrMetadata means permissions, extended attributes, ACLs or timestamps could not be
-	// reproduced exactly on the copy.
+	// ErrMetadata means permissions, extended attributes, ACLs, timestamps, Linux file attributes
+	// (chattr flags and the project ID) or ZFS DOS attributes could not be reproduced exactly on
+	// the copy.
 	ErrMetadata error = &sentinel{"couldn't keep the file's permissions, attributes or timestamps exactly"}
 	// ErrChecksum means the copy read back differently from the original.
 	ErrChecksum error = &sentinel{"the new copy didn't match the original when checked"}
 	// ErrNotRegular means the name is not a regular file (for example a symlink or a pipe).
 	ErrNotRegular error = &sentinel{"it isn't a regular file"}
-	// ErrLinkMismatch means the file's hardlinked names are not the ones expected.
+	// ErrLinkMismatch means the file's hardlinked names are not the ones expected, for example
+	// because one of them was removed or renamed while the names were being switched over.
 	ErrLinkMismatch error = &sentinel{"the file's hardlinks don't match what was expected"}
+	// ErrImmutable means the file is marked immutable, append-only or undeletable, so it can't be
+	// replaced. It is noticed before anything is copied.
+	ErrImmutable error = &sentinel{"it's marked immutable or append-only (" + immutableHint + "), so it was left alone"}
 	// ErrUnsupportedPlatform is returned on operating systems other than Linux and macOS.
 	ErrUnsupportedPlatform error = &sentinel{"rewriting files is only supported on Linux and macOS"}
+)
+
+// Short reasons shared by several steps.
+const (
+	tempGone       = "its temporary copy was removed or replaced by another program"
+	nameGone       = "one of its names was removed or renamed by another program"
+	ownerOverQuota = "its owner or group is over their quota"
 )
 
 // failure is the error type returned by ReplaceGroup. Its message is meant for end users; errors.Is
 // sees both its kind (one of the sentinels above) and the underlying cause.
 type failure struct {
 	kind    *sentinel // nil for an unexpected problem described by what
-	what    string
+	what    string    // replaces the kind's own text when set
 	detail  string
 	cause   error
 	swapped int // hardlinked names already switched to the new copy when the failure happened
@@ -51,7 +65,7 @@ type failure struct {
 
 func (e *failure) Error() string {
 	var b strings.Builder
-	if e.kind != nil {
+	if e.what == "" && e.kind != nil {
 		b.WriteString(e.kind.base)
 	} else {
 		b.WriteString(e.what)
@@ -90,6 +104,15 @@ func failKind(kind error, detail string, cause error) error {
 		return fail("", cause)
 	}
 	return &failure{kind: kind.(*sentinel), detail: detail, cause: cause}
+}
+
+// ownershipErr describes a failure to give the copy the original's owner or group. ZFS refuses
+// with EDQUOT when that owner or group is over their quota; that counts as running out of space.
+func ownershipErr(err error) error {
+	if errors.Is(err, syscall.EDQUOT) {
+		return &failure{kind: ErrNoSpace.(*sentinel), detail: ownerOverQuota, cause: err}
+	}
+	return failKind(ErrOwnership, "", err)
 }
 
 // fail wraps an unexpected error from step what ("couldn't read the file"), turning running out of

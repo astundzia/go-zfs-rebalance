@@ -161,7 +161,7 @@ func TestErrorMessages(t *testing.T) {
 	require.Equal(t, "couldn't keep the file's owner (try running with sudo) — nothing was changed", ErrOwnership.Error())
 
 	for _, sentinel := range []error{ErrModified, ErrNoSpace, ErrOwnership, ErrMetadata, ErrChecksum,
-		ErrNotRegular, ErrLinkMismatch, ErrUnsupportedPlatform} {
+		ErrNotRegular, ErrLinkMismatch, ErrImmutable, ErrUnsupportedPlatform} {
 		require.Regexp(t, `^[a-z].* — nothing was changed$`, sentinel.Error())
 	}
 
@@ -173,25 +173,56 @@ func TestErrorMessages(t *testing.T) {
 		name    string
 		err     error
 		is      []error
+		isNot   []error
 		message string
 	}{
 		{
 			name:    "no space",
 			err:     fail("couldn't write the new copy", pathErr(syscall.ENOSPC)),
 			is:      []error{ErrNoSpace, syscall.ENOSPC},
+			isNot:   []error{syscall.EDQUOT},
 			message: "not enough free space — nothing was changed",
 		},
 		{
 			name:    "quota",
 			err:     fail("couldn't write the new copy", pathErr(syscall.EDQUOT)),
 			is:      []error{ErrNoSpace, syscall.EDQUOT},
+			isNot:   []error{syscall.ENOSPC},
 			message: "not enough free space (a quota was reached) — nothing was changed",
 		},
 		{
 			name:    "no space while setting metadata",
 			err:     failKind(ErrMetadata, "extended attribute user.x", pathErr(syscall.ENOSPC)),
 			is:      []error{ErrNoSpace, syscall.ENOSPC},
+			isNot:   []error{ErrMetadata, syscall.EDQUOT},
 			message: "not enough free space — nothing was changed",
+		},
+		{
+			name:    "quota while setting metadata",
+			err:     failKind(ErrMetadata, "extended attribute user.x", pathErr(syscall.EDQUOT)),
+			is:      []error{ErrNoSpace, syscall.EDQUOT},
+			isNot:   []error{ErrMetadata, syscall.ENOSPC},
+			message: "not enough free space (a quota was reached) — nothing was changed",
+		},
+		{
+			name:    "owner over quota",
+			err:     ownershipErr(&os.SyscallError{Syscall: "fchown", Err: syscall.EDQUOT}),
+			is:      []error{ErrNoSpace, syscall.EDQUOT},
+			isNot:   []error{ErrOwnership, syscall.ENOSPC},
+			message: "not enough free space (its owner or group is over their quota) — nothing was changed",
+		},
+		{
+			name:    "owner can't be kept",
+			err:     ownershipErr(&os.SyscallError{Syscall: "fchown", Err: syscall.EPERM}),
+			is:      []error{ErrOwnership, syscall.EPERM},
+			isNot:   []error{ErrNoSpace},
+			message: "couldn't keep the file's owner (try running with sudo) — nothing was changed",
+		},
+		{
+			name:    "own wording for a kind",
+			err:     &failure{kind: ErrImmutable.(*sentinel), what: "it's protected from being deleted, so it was left alone"},
+			is:      []error{ErrImmutable},
+			message: "it's protected from being deleted, so it was left alone — nothing was changed",
 		},
 		{
 			name:    "plain I/O error hides the temporary path",
@@ -234,6 +265,9 @@ func TestErrorMessages(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			for _, target := range tt.is {
 				require.ErrorIs(t, tt.err, target)
+			}
+			for _, target := range tt.isNot {
+				require.NotErrorIs(t, tt.err, target)
 			}
 			require.Equal(t, tt.message, tt.err.Error())
 		})

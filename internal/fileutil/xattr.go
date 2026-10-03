@@ -54,16 +54,17 @@ func readXattrs(f *os.File) (map[string][]byte, error) {
 	return attrs, err
 }
 
-// applyXattrs makes f's extended attributes exactly want: extras (for example an ACL inherited from
-// the directory) are removed and missing or different ones are written.
-func applyXattrs(f *os.File, want map[string][]byte) error {
+// applyXattrs makes the extended attributes of f that match pick exactly those in want: extras (for
+// example an ACL inherited from the directory) are removed and missing or different ones are
+// written. Attributes that don't match pick are left alone.
+func applyXattrs(f *os.File, want map[string][]byte, pick func(name string) bool) error {
 	have, err := readXattrs(f)
 	if err != nil {
 		return err
 	}
 	return withFd(f, func(fd int) error {
 		for _, name := range slices.Sorted(maps.Keys(have)) {
-			if _, keep := want[name]; keep {
+			if _, keep := want[name]; keep || !pick(name) {
 				continue
 			}
 			if err := unix.Fremovexattr(fd, name); err != nil && !isNoXattr(err) {
@@ -71,6 +72,9 @@ func applyXattrs(f *os.File, want map[string][]byte) error {
 			}
 		}
 		for _, name := range slices.Sorted(maps.Keys(want)) {
+			if !pick(name) {
+				continue
+			}
 			if cur, ok := have[name]; ok && bytes.Equal(cur, want[name]) {
 				continue
 			}
@@ -129,6 +133,11 @@ func getXattr(fd int, name string) (val []byte, ok bool, err error) {
 	}
 	return nil, false, unix.ERANGE
 }
+
+// isACLXattr reports whether name is an extended attribute that holds an ACL.
+func isACLXattr(name string) bool { return slices.Contains(aclXattrs, name) }
+
+func isOtherXattr(name string) bool { return !isACLXattr(name) }
 
 // xattrError names the attribute that couldn't be read or written.
 type xattrError struct {

@@ -11,6 +11,9 @@ import (
 // probedXattrs are read even when listxattr doesn't report them. macOS lists every attribute.
 var probedXattrs []string
 
+// aclXattrs is empty: a macOS ACL is not an extended attribute (see acl_darwin.go).
+var aclXattrs []string
+
 // kernelManagedXattr reports attributes the kernel sets on every new file and silently refuses to
 // change, so they can be neither copied nor compared.
 func kernelManagedXattr(name string) bool { return name == "com.apple.provenance" }

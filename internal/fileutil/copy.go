@@ -34,6 +34,7 @@ func (w plainWriter) Truncate(size int64) error                    { return w.f.
 // as soon as src turns out to be longer than limit, so a growing file can't keep it busy forever.
 func copyData(ctx context.Context, dst plainWriter, src plainReader, h hash.Hash, buf []byte, limit int64) (int64, error) {
 	var total int64
+	holeAtEnd := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return total, fail("", err)
@@ -45,7 +46,8 @@ func copyData(ctx context.Context, dst plainWriter, src plainReader, h hash.Hash
 				return total, failKind(ErrModified, "", nil)
 			}
 			h.Write(buf[:n])
-			if err := writeSparse(dst, buf[:n]); err != nil {
+			var err error
+			if holeAtEnd, err = writeSparse(dst, buf[:n]); err != nil {
 				return total, fail("couldn't write the new copy", err)
 			}
 		}
@@ -56,16 +58,19 @@ func copyData(ctx context.Context, dst plainWriter, src plainReader, h hash.Hash
 			return total, fail("couldn't read the file", rerr)
 		}
 	}
-	// Trailing zero chunks were skipped, so set the final length explicitly.
-	if err := dst.Truncate(total); err != nil {
-		return total, fail("couldn't write the new copy", err)
+	// Trailing zero chunks were skipped, so set the final length explicitly. Only then: on ZFS a
+	// truncate checks the copy's ACL again, and the copy already has the original's.
+	if holeAtEnd {
+		if err := dst.Truncate(total); err != nil {
+			return total, fail("couldn't write the new copy", err)
+		}
 	}
 	return total, nil
 }
 
 // writeSparse writes p at dst's current offset, seeking over runs of all-zero chunks instead of
-// writing them.
-func writeSparse(dst plainWriter, p []byte) error {
+// writing them. holeAtEnd reports whether the end of p was skipped rather than written.
+func writeSparse(dst plainWriter, p []byte) (holeAtEnd bool, err error) {
 	for len(p) > 0 {
 		n := min(zeroChunk, len(p))
 		zero := isZero(p[:n])
@@ -76,18 +81,18 @@ func writeSparse(dst plainWriter, p []byte) error {
 			}
 			n = next
 		}
-		var err error
 		if zero {
 			_, err = dst.Seek(int64(n), io.SeekCurrent)
 		} else {
 			_, err = dst.Write(p[:n])
 		}
 		if err != nil {
-			return err
+			return false, err
 		}
+		holeAtEnd = zero
 		p = p[n:]
 	}
-	return nil
+	return holeAtEnd, nil
 }
 
 func isZero(p []byte) bool { return bytes.Equal(p, zeroes[:len(p)]) }

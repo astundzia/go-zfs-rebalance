@@ -8,9 +8,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// probedXattrs are read even when listxattr doesn't report them: OpenZFS keeps NFSv4 ACLs
-// (TrueNAS SCALE) in a hidden system.nfs4_acl_xdr attribute.
-var probedXattrs = []string{"system.nfs4_acl_xdr", "system.posix_acl_access"}
+// aclXattrs are the extended attributes that hold a file's ACL: an NFSv4 ACL, which OpenZFS keeps
+// in system.nfs4_acl_xdr (TrueNAS SCALE), or a POSIX ACL.
+var aclXattrs = []string{"system.nfs4_acl_xdr", "system.posix_acl_access"}
+
+// probedXattrs are read even when listxattr doesn't report them, which OpenZFS doesn't for
+// system.nfs4_acl_xdr.
+var probedXattrs = aclXattrs
 
 // kernelManagedXattr reports attributes the kernel sets on every new file and silently refuses to
 // change. Linux has none.

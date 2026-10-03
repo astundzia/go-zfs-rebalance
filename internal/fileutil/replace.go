@@ -14,10 +14,19 @@ import (
 	"slices"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
-// beforeSwapHook, when set by tests, runs right before the final check that the file is unchanged.
-var beforeSwapHook func()
+// Test seams, nil in production. afterPrepareHook runs once the empty copy has its owner, ACL and
+// permission bits and before any data is written to it. beforeSwapHook runs right before the final
+// check that the file is unchanged. beforeNameSwapHook runs right before each name is switched over
+// to the copy; tempRel is the temporary name about to be renamed over name.
+var (
+	afterPrepareHook   func(tmpRel string)
+	beforeSwapHook     func()
+	beforeNameSwapHook func(tempRel, name string)
+)
 
 // tempAttempts bounds retries when a randomly chosen temporary name is already taken.
 const tempAttempts = 10
@@ -28,7 +37,9 @@ const tempAttempts = 10
 // The data is copied and verified once. Each other name is then switched over by linking the copy
 // under a new temporary name next to it, checking that the name still refers to the original, and
 // renaming the link over it; rels[0] is switched last. Every switch is atomic, so if the process
-// stops part-way the names already switched point at the new, identical copy and nothing is lost.
+// stops part-way the names already switched point at the new, identical copy and nothing is lost;
+// the error then says how many names were switched. A name that disappears while the names are
+// being switched gives an ErrLinkMismatch error that also matches fs.ErrNotExist.
 func ReplaceGroup(ctx context.Context, root *os.Root, rels []string, opts Options) (Result, error) {
 	start := time.Now()
 	h, err := opts.Checksum.newHash()
@@ -41,7 +52,7 @@ func ReplaceGroup(ctx context.Context, root *os.Root, rels []string, opts Option
 	if err := ctx.Err(); err != nil {
 		return Result{}, fail("", err)
 	}
-	r := &replacer{root: root, names: make([]string, len(rels))}
+	r := &replacer{root: root, names: make([]string, len(rels)), lockFd: -1}
 	for i, rel := range rels {
 		r.names[i] = path.Clean(rel)
 	}
@@ -68,16 +79,26 @@ func (c ChecksumType) newHash() (hash.Hash, error) {
 
 // replacer holds the state of one ReplaceGroup call so that cleanup can undo it.
 type replacer struct {
-	root  *os.Root
-	names []string
-	src   *os.File
-	tmp   *os.File // open until it is closed successfully
-	tmpID FileID
-	temps []string // temporary names created and not yet renamed over a real name
+	root   *os.Root
+	names  []string
+	src    *os.File
+	tmp    *os.File // open until it is closed successfully
+	tmpID  FileID
+	lockFd int      // holds the temporary file's lock until its names are gone; -1 if none
+	temps  []string // temporary names created and not yet renamed over a real name
 }
 
+// run does the rewrite: open and check the original (refusing immutable files), create and lock an
+// empty temporary copy, give it the original's owner, project, ACL and permission bits
+// (prepareTemp), copy and verify the data, give it everything else (finishTemp), and once the
+// original is known to be unchanged, rename the copy over every name (and undo what the renames
+// themselves change, see afterSwap).
 func (r *replacer) run(ctx context.Context, h hash.Hash, bufSize int) (Result, error) {
 	before, err := r.openSource()
+	if err != nil {
+		return Result{}, err
+	}
+	want, err := readWanted(r.src)
 	if err != nil {
 		return Result{}, err
 	}
@@ -88,11 +109,19 @@ func (r *replacer) run(ctx context.Context, h hash.Hash, bufSize int) (Result, e
 	}
 	r.tmp = tmp
 	r.temps = append(r.temps, tmpRel)
+	r.lockFd = lockTemp(tmp)
 	tmpInfo, err := statFile(tmp)
 	if err != nil {
 		return Result{}, fail("couldn't check the new copy", err)
 	}
 	r.tmpID = tmpInfo.ID
+
+	if err := prepareTemp(r.root, r.names, tmp, before, want); err != nil {
+		return Result{}, err
+	}
+	if afterPrepareHook != nil {
+		afterPrepareHook(tmpRel)
+	}
 
 	if bufSize <= 0 {
 		bufSize = defaultBufferSize
@@ -118,7 +147,7 @@ func (r *replacer) run(ctx context.Context, h hash.Hash, bufSize int) (Result, e
 		return Result{}, err
 	}
 
-	if err := copyMetadata(r.root, r.src, tmp, tmpRel, before); err != nil {
+	if err := finishTemp(r.root, tmp, tmpRel, before, want); err != nil {
 		return Result{}, err
 	}
 	r.tmp = nil
@@ -137,6 +166,9 @@ func (r *replacer) run(ctx context.Context, h hash.Hash, bufSize int) (Result, e
 	}
 	if err := r.swap(before, tmpRel); err != nil {
 		return Result{}, err
+	}
+	if r.lockFd >= 0 {
+		afterSwap(r.lockFd, want.attrs)
 	}
 	syncDirs(r.root, r.names)
 	return Result{Size: n, Before: before, NewID: r.tmpID}, nil
@@ -181,8 +213,13 @@ func (r *replacer) openSource() (Info, error) {
 		}
 	}
 
-	// O_NONBLOCK keeps a pipe swapped in at the last moment from blocking the open.
-	src, err := r.root.OpenFile(r.names[0], os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	// O_NONBLOCK keeps a pipe swapped in at the last moment from blocking the open. Linux refuses
+	// O_NOATIME to anyone but the file's owner and root; then the file is read the usual way.
+	const flags = os.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_NONBLOCK
+	src, err := r.root.OpenFile(r.names[0], flags|openNoATime, 0)
+	if openNoATime != 0 && errors.Is(err, syscall.EPERM) {
+		src, err = r.root.OpenFile(r.names[0], flags, 0)
+	}
 	if err != nil {
 		return Info{}, fail("couldn't open the file", err)
 	}
@@ -202,12 +239,16 @@ func (r *replacer) openSource() (Info, error) {
 }
 
 // checkUnchanged makes sure nothing touched the original or the copy while the copy was made.
+// A name that has gone is reported as such, even though removing it also changed the others.
 func (r *replacer) checkUnchanged(before Info, tmpRel string) error {
-	for _, name := range r.names {
-		now, err := Lstat(r.root, name)
-		if err != nil {
-			return fail("couldn't check the file", err)
+	infos := make([]Info, len(r.names))
+	for i, name := range r.names {
+		var err error
+		if infos[i], err = Lstat(r.root, name); err != nil {
+			return r.nameErr(err)
 		}
+	}
+	for _, now := range infos {
 		if now.ID != before.ID || now.Size != before.Size || !now.Mtime.Equal(before.Mtime) ||
 			!now.Ctime.Equal(before.Ctime) || now.Nlink != before.Nlink {
 			return failKind(ErrModified, "", nil)
@@ -216,10 +257,19 @@ func (r *replacer) checkUnchanged(before Info, tmpRel string) error {
 	return r.checkTemp(tmpRel)
 }
 
+// nameErr describes a failure to look up one of the file's names. For a hardlink group a name
+// that has gone means its set of names changed.
+func (r *replacer) nameErr(err error) error {
+	if len(r.names) > 1 && errors.Is(err, fs.ErrNotExist) {
+		return failKind(ErrLinkMismatch, nameGone, err)
+	}
+	return fail("couldn't check the file", err)
+}
+
 // checkTemp makes sure tempRel is still a name of our verified copy.
 func (r *replacer) checkTemp(tempRel string) error {
 	if now, err := Lstat(r.root, tempRel); err != nil || now.ID != r.tmpID {
-		return failKind(ErrModified, "its temporary copy was removed or replaced by another program", err)
+		return failKind(ErrModified, tempGone, err)
 	}
 	return nil
 }
@@ -229,6 +279,13 @@ func (r *replacer) checkTemp(tempRel string) error {
 func (r *replacer) swap(before Info, tmpRel string) error {
 	for i := 1; i < len(r.names); i++ {
 		linkRel, err := linkTemp(r.root, tmpRel, path.Dir(r.names[i]), randomTempName)
+		if errors.Is(err, fs.ErrNotExist) {
+			// The name's folder has gone, or the copy's own name was removed.
+			if r.checkTemp(tmpRel) == nil {
+				return r.partial(i-1, failKind(ErrLinkMismatch, nameGone, err))
+			}
+			return r.partial(i-1, failKind(ErrModified, tempGone, err))
+		}
 		if err != nil {
 			return r.partial(i-1, fail("couldn't link the new copy to the file's other names", err))
 		}
@@ -244,19 +301,25 @@ func (r *replacer) swap(before Info, tmpRel string) error {
 }
 
 func (r *replacer) swapOne(before Info, tempRel, name string) error {
+	if beforeNameSwapHook != nil {
+		beforeNameSwapHook(tempRel, name)
+	}
 	if err := r.checkTemp(tempRel); err != nil {
 		return err
 	}
 	now, err := Lstat(r.root, name)
 	switch {
 	case err != nil:
-		return fail("couldn't check the file", err)
+		return r.nameErr(err)
 	case now.ID != before.ID:
 		return failKind(ErrLinkMismatch, "", nil)
 	case now.Size != before.Size || !now.Mtime.Equal(before.Mtime):
 		return failKind(ErrModified, "", nil)
 	}
 	if err := r.root.Rename(tempRel, name); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return failKind(ErrModified, tempGone, err)
+		}
 		return fail("couldn't swap in the new copy", err)
 	}
 	r.temps = slices.DeleteFunc(r.temps, func(t string) bool { return t == tempRel })
@@ -273,7 +336,8 @@ func (r *replacer) partial(swapped int, err error) error {
 }
 
 // cleanup closes the files and removes every temporary name that was not renamed over a real name,
-// which after a failure is all of them.
+// which after a failure is all of them. The lock goes last, so no other run ever sees one of these
+// names unlocked.
 func (r *replacer) cleanup() {
 	if r.tmp != nil {
 		_ = r.tmp.Close()
@@ -286,6 +350,9 @@ func (r *replacer) cleanup() {
 			clearACL(r.root, rel, r.tmpID)
 			_ = r.root.Remove(rel)
 		}
+	}
+	if r.lockFd >= 0 {
+		_ = unix.Close(r.lockFd)
 	}
 }
 

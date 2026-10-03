@@ -1,10 +1,12 @@
 // Package fileutil rewrites a file in place so that its data lands on fresh blocks, while keeping
-// everything else about it (contents, owner, permissions, extended attributes, ACLs and timestamps)
-// exactly the same.
+// everything else about it (contents, owner, permissions, extended attributes, ACLs, timestamps
+// and, on Linux, chattr flags, project ID and ZFS DOS attributes) exactly the same.
 //
 // The original is never removed or truncated: a verified copy is built under a temporary name in
 // the same directory and then atomically renamed over the original. If anything goes wrong, or the
-// context is cancelled, the temporary copy is removed and the original is left untouched.
+// context is cancelled, the temporary copy is removed and the original is left untouched. While a
+// temporary copy exists it is locked, so another run can tell it apart from one left behind by a
+// run that was killed (see RemoveStaleTemp).
 package fileutil
 
 import (
@@ -72,15 +74,16 @@ type FileID struct{ Dev, Ino uint64 }
 
 // Info is the subset of a file's status that the rewrite has to preserve or watch for changes.
 type Info struct {
-	ID    FileID
-	Size  int64
-	Mode  os.FileMode // full Go mode, including setuid, setgid and sticky bits
-	Nlink uint64
-	UID   uint32
-	GID   uint32
-	Atime time.Time
-	Mtime time.Time
-	Ctime time.Time
+	ID     FileID
+	Size   int64
+	Blocks int64       // bytes allocated on disk (st_blocks × 512); less than Size for sparse or compressed files
+	Mode   os.FileMode // full Go mode, including setuid, setgid and sticky bits
+	Nlink  uint64
+	UID    uint32
+	GID    uint32
+	Atime  time.Time
+	Mtime  time.Time
+	Ctime  time.Time
 }
 
 // Lstat returns Info for rel inside root without following a final symlink.
@@ -113,8 +116,11 @@ type Result struct {
 //
 // The original is never removed before the new copy is complete and verified; the swap is a single
 // rename over it. On any error or context cancellation the temporary copy is removed and the
-// original is left untouched. A file with more than one hardlink is refused with ErrLinkMismatch;
-// use ReplaceGroup for those.
+// original is left untouched; on Linux it is read without updating its access time where the
+// kernel allows that (as root, or as the file's owner). A file that can't be given the original's
+// owner (ErrOwnership) or is marked immutable or append-only (ErrImmutable) is refused before any
+// data is copied. A file with more than one hardlink is refused with ErrLinkMismatch; use
+// ReplaceGroup for those.
 func ReplaceInPlace(ctx context.Context, root *os.Root, rel string, opts Options) (Result, error) {
 	return ReplaceGroup(ctx, root, []string{rel}, opts)
 }
