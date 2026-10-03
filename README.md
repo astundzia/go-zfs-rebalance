@@ -236,10 +236,12 @@ It's worth planning for: for example, rebalance just before a full backup.
 
 ### What about hardlinked files?
 
-A hardlinked file is one file with several names. They're skipped by default, and the summary
-tells you how many there were. Add `--process-hardlinks` to include them: the file is copied once,
-and every name is switched over to the new copy, so they stay linked together. Its line in the
-log lists its other names too (up to three, then how many more).
+A hardlinked file is one file with several names. They're skipped by default: the run names up to
+five of them (then how many more), the summary counts them, and it tells you how to include them.
+Add `--process-hardlinks` to include them: the file is copied once, and every name is switched
+over to the new copy, so they stay linked together. Its line in the log lists its other names too
+(up to three, then how many more). Once a hardlinked file has been rewritten that way, a later
+`--resume` without `--process-hardlinks` counts it as already done, not as hardlinked.
 
 If some of a file's names are outside the folder you gave, it's left alone, because rewriting only
 some of its names would split it into two separate copies. Each of its names in the folder is
@@ -275,11 +277,12 @@ ready.
 A skipped file is always left exactly as it was, and skipping doesn't change the exit code. The
 summary at the end counts skipped files by reason, such as
 `Skipped 12 files: 8 already done, 4 hardlinked.` Most of them also get a `! skipped` line in the
-log that names the file and says why, and `--debug` shows every one.
+log that names the file and says why (hardlinked files are named together in one list instead: up
+to five of them, or all of them with `--debug`).
 
 | Reason | What it means | What to do |
 |---|---|---|
-| Already done | Rewritten by an earlier run, and you added `--resume`. | Nothing. |
+| Already done | Rewritten by an earlier run, and you added `--resume`. That includes hardlinked files rewritten with `--process-hardlinks`. | Nothing. |
 | Hardlinked | One file with several names. | Add `--process-hardlinks`. |
 | Hardlinks outside the folder | Some of the file's names are outside the folder you gave. | Point it at a folder that holds all the names. |
 | Leftover .balance file | May be the only copy of a file, left by version 1. | See [the .balance question](#i-used-version-1-what-are-these-balance-files). |
@@ -307,7 +310,7 @@ owner or a project ID), the summary says that nothing new was rebalanced, and wh
 `0` means it finished; skipped files don't count as failures. `1` means some files couldn't be
 rewritten (each was left as it was). `2` means it didn't start, for example because of a typo in an
 option. `3` means it stopped early, because a file went missing (`--halt-on-missing`) or the pool or
-dataset ran out of space. `130` means it was stopped with Ctrl+C. See the
+dataset ran out of space (or reached its quota). `130` means it was stopped with Ctrl+C. See the
 [Exit codes](#exit-codes) table for details.
 
 ### I used version 1. What are these .balance files?
@@ -528,7 +531,7 @@ In more detail:
 | `--process-hardlinks` | Also rewrites hardlinked files, keeping all their names linked together. | off (skipped) |
 | `--no-cleanup` | Keeps the temporary files (`.zfs-rebalance.<random>.tmp`) left by a run that was stopped hard, instead of removing them. The old name, `--no-cleanup-balance`, still works. | off (removed) |
 | `--no-random` | Works through files in folder order, instead of a random order. | random |
-| `--checksum TYPE` | How each copy is checked against the original: `sha256` or `md5`. | `sha256` |
+| `--checksum TYPE` | How each copy is checked against the original: `sha256` or `md5`. If you leave the type out, so the folder ends up in its place, it tells you. | `sha256` |
 | `--size-threshold MB` | Only lists rewritten files of at least this many megabytes (MiB). Smaller files are still rewritten, and `--debug` lists them. | 0 (list all) |
 | `--halt-on-missing` | Stops the run if a file disappears before it's rewritten, instead of skipping it. | off |
 | `--filename-only` | Shows just file names in the log, without their folders. | off |
@@ -591,11 +594,14 @@ How it's used:
   everything a second time, use `--resume --passes 2`. Most people never need that.
 
 The same folder also holds `run.lock`, which makes sure only one `rebalance` using that folder runs
-at a time. (With `--db`, the lock sits next to that file instead.) Runs that keep their progress
-somewhere else, such as another user's runs or ones with a different `--db`, aren't stopped by it,
-but they still can't trip over each other's files: a file that another run is working on is
-skipped as busy, and a temporary copy that another run is still using is never removed. It's safe
-to delete these files once you're done.
+at a time. With `--db`, the lock sits next to that file instead, so two `--db` files in the
+**same** folder share one lock, and the second run won't start while the first is going. Only runs
+whose progress is in **different** folders can go at once, such as `--db` files in two separate
+folders, or another user's runs. They still can't trip over each other's files: a file that
+another run is working on is skipped as busy, and a temporary copy that another run is still using
+is never removed. But each run sees the other's changes as another program's, so folders they both
+work in may keep a new modified time, and each run's summary says how many. It's safe to delete
+the progress files and `run.lock` once you're done.
 
 ### How it works
 
@@ -623,8 +629,9 @@ For each file, `rebalance`:
    hidden copy just before the swap and so changed its access time, the time is put back.
 7. **Records it** in the progress file. Once a folder's files are done, its own modified time is
    put back, so tools that watch folder times don't rescan everything. If something else changed
-   the folder in the meantime, its new time is left alone. If a time can't be put back, a warning
-   says so, and the summary counts those folders.
+   the folder in the meantime, its new time is left alone, and the summary says how many folders
+   that happened to. If a time can't be put back, a warning says so, and the summary counts those
+   folders too.
 
 If any step fails, or the run is stopped, the copy is deleted and the original is left exactly as
 it was.
@@ -668,8 +675,9 @@ recordsize.
   the folder's ID, the usual case, are rewritten as normal.
 - **Permissions that can't be kept exactly.** On TrueNAS SMB shares (`aclmode=restricted`), a
   setuid or setgid file that also has ACL entries of its own can't get those bits back on a new
-  copy, so it's skipped and left untouched. Like every skipped file, it doesn't change the exit
-  code.
+  copy, so it's skipped and left untouched. Its log line says just that: its setuid/setgid bit
+  can't be put back on a copy while it has ACL entries of its own. Like every skipped file, it
+  doesn't change the exit code.
 - **Without `sudo`**, only your own files are rewritten: ones you own, with a group you're in.
   Everything else is skipped before anything is copied.
 - **`trusted.*` extended attributes** (used by a few system tools, such as overlayfs) are only
@@ -682,10 +690,13 @@ recordsize.
 - **After a third Ctrl+C, `kill -9` or a power cut**, the folders it was working in may keep a new
   modified time, because it quits without tidying up. Nothing else changes, and the next run
   removes any leftover temporary files. One or two Ctrl+Cs don't have this problem.
-- **Running out of space.** If the pool or the dataset is full, the run stops (exit code 3) rather
-  than failing every file after it. It still puts folder times back, trying again for a few
-  seconds if ZFS hasn't yet freed the space of the copies it threw away. If a user or group quota
-  is reached while the dataset still has room, only that owner's files are skipped, and the run
+- **Running out of space.** If the pool or the dataset is full, or the dataset reaches its quota,
+  the run stops (exit code 3) rather than failing every file after it. When a quota was the cause,
+  the message says a quota was reached (not that the pool ran out of space), and suggests raising
+  the quota or freeing some space. It still puts folder times back: ZFS only hands back the space
+  of the copies it threw away at its next write-out (usually within 5 to 10 seconds), so it keeps
+  trying for up to 15 seconds. If a user or group quota is
+  reached while the dataset still has room, only that owner's files are skipped, and the run
   carries on.
 - **It stays inside the folder.** It never follows a symlink out of it, and only ever removes its
   own temporary files (`.zfs-rebalance.<12 hex digits>.tmp`), and never one that another run is
@@ -700,7 +711,7 @@ recordsize.
 | `0` | Finished. Files that were skipped (such as hardlinked, immutable or busy ones, other users' files without `sudo`, or ones whose permissions can't be kept exactly) don't change this. |
 | `1` | Some files couldn't be rewritten, and each was left as it was. Or the folder couldn't be read. |
 | `2` | Didn't start, so nothing was changed. For example: a mistake in the options, the folder doesn't exist, another run is in progress, a problem with the progress file, an unsupported system, or `--report` on a folder that isn't on ZFS. |
-| `3` | Stopped early: a file went missing (with `--halt-on-missing`), or the pool or dataset ran out of space. |
+| `3` | Stopped early: a file went missing (with `--halt-on-missing`), or the pool or dataset ran out of space (or reached its quota). |
 | `130` | Stopped by Ctrl+C, by another stop signal, because the terminal or SSH session closed, or because the program reading its output (such as `head`) quit. |
 
 ### Building and testing

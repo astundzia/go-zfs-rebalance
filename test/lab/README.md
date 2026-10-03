@@ -57,8 +57,9 @@ and `TRUENAS_VERSION` / `TRUENAS_TRAIN` to try another TrueNAS release.
 - files owned by other users, including setuid, setgid and sticky-bit files
 - extended attributes, plus POSIX ACLs (`--acl posix`) or NFSv4 ACLs (`--acl nfs4`, TrueNAS). The
   NFSv4 mode also works on SMB-style datasets (`aclmode=restricted`), where `chmod` is refused while
-  a file has a non-trivial ACL: it strips the ACL first, sets the mode, then adds the test ACEs. It
-  adds `owners/alice-setuid-ace`, a setuid file with an explicit ACE
+  a file has a non-trivial ACL: it strips the ACL first, sets the mode, then adds the test ACEs
+  (the `--flags` files get the same strip-then-chmod treatment, without extra ACEs). It adds `owners/alice-setuid-ace`, a setuid file with an explicit
+  ACE
 - a hardlink group fully inside the folder, and one with a link outside it
 - `ledger.balance` and `movie.mkv.balance`, both with no original next to them. Version 1 would
   have deleted them; version 2 can't tell a real file from a version 1 leftover that may be the
@@ -97,9 +98,20 @@ Each scenario lists what must be true for it to pass.
 
 ### 1. Go tests on real ZFS
 
+The tests need a dataset of their own that can run programs and has POSIX ACLs. On Linux, ZFS
+turns POSIX ACLs off by default, and without them the POSIX-ACL tests
+(`TestReplaceInPlaceReplacesInheritedPOSIXACL`) skip:
+
+```sh
+sudo zfs create -o exec=on -o acltype=posixacl -o xattr=sa tank/gotest
+```
+
+On TrueNAS, make `tank/gotest` in the web UI or with `midclt`, with the POSIX ACL type (not as an
+SMB share) and exec on. Its `/tmp` and `/home` are mounted `noexec`, so the tests can't run there.
+
 Build Linux test binaries on your machine (without the race detector, so they cross-compile), and
-copy them, with `internal/zfs/testdata`, into a dataset that can run programs, such as
-`/tank/gotest` (`/mnt/tank/gotest` on TrueNAS, where `/tmp` and `/home` are mounted `noexec`):
+copy them, with `internal/zfs/testdata`, into that dataset (`/tank/gotest`, or `/mnt/tank/gotest`
+on TrueNAS):
 
 ```sh
 mkdir -p linuxtests
@@ -130,7 +142,7 @@ it makes. (The lab's SMB-share runs cover that case for the tool itself.)
 
 | Scenario | Must be true |
 |---|---|
-| Each package, as root | `PASS`. The root-only tests really ran (`--- PASS: Test…Root…` lines), including the ZFS DOS attribute, nounlink, project ID (kept, and refused when its `+P` folder won't take it), capability and immutable ones |
+| Each package, as root | `PASS`. The root-only tests really ran (`--- PASS: Test…Root…` lines), including the ZFS DOS attribute, nounlink, project ID (kept, and refused when its `+P` folder won't take it), capability and immutable ones, and the POSIX-ACL ones didn't skip |
 | Each package, as an ordinary user | `PASS`. Root-only tests skip, saying why |
 | Expected skips | The chattr `noatime` flag (ZFS has none), nodump inheritance (a filesystem choice), and tests meant only for root or only for an ordinary user. Tests that need to run a program they make skip where they can't, rather than fail |
 | `TestFolderTimesKeptWhenAnotherProgramChangesTheFolder`, repeated (`-test.count=10`) | Passes every time, as root and not, on ZFS and on `tmpfs` |
@@ -173,9 +185,10 @@ middleware on TrueNAS, like a real user would), then:
 
 | Scenario | Must be true |
 |---|---|
-| Default run | Hardlinked files skipped and counted |
+| Default run | Hardlinked files skipped, counted, and named at normal verbosity (up to five, then "…and N more"), with the hint to add `--process-hardlinks` |
 | `--process-hardlinks` | A group fully inside the folder ends up sharing one new inode (same link count). Its `✓ rebalanced` line lists the other names without `--debug` (up to three, then "+N more") |
 | A link outside the folder | That group is left alone and reported |
+| `--resume` without `--process-hardlinks`, after a `--process-hardlinks` run | The group that was rewritten counts as already done, not hardlinked, and isn't counted in the `--process-hardlinks` hint |
 
 ### 5. Stopping and resuming
 
@@ -198,7 +211,7 @@ middleware on TrueNAS, like a real user would), then:
 
 | Scenario | Must be true |
 |---|---|
-| Missing folder, two folders, bad option values | Exit 2 with a clear message; nothing changed. A bad number or choice gets plain words ("--concurrency needs a whole number, like 4"), not Go's `flag -concurrency` wording |
+| Missing folder, two folders, bad option values | Exit 2 with a clear message; nothing changed. A bad number or choice gets plain words ("--concurrency needs a whole number, like 4"), not Go's `flag -concurrency` wording. `rebalance --checksum /tank/data` (the type left out) says `--checksum` needs sha256 or md5 and that the folder looks like it was taken as its value, not "please give the folder" |
 | Options after the folder | Honoured |
 | A second run while one is going | Exit 2: "another rebalance is already running" |
 | Running as an ordinary user (`sudo -u alice -H rebalance …` on a mixed-owner folder) | Alice's own files rewritten. Files owned by other users, or with a group she isn't in, are skipped **before anything is copied**: their access times are unchanged and no data is written for them. Files she may not replace (unreadable, or in someone else's folder) are skipped, not failed. Exit 0, and the hint says to run it with `sudo` (not `--resume`). Folder times put back, or a warning if they couldn't be |
@@ -206,17 +219,24 @@ middleware on TrueNAS, like a real user would), then:
 | Folder not on ZFS | A normal run warns; `--report` exits 2 |
 | Dataset with snapshots | Warning before starting, and a note under the after table |
 | Dedup turned on | Warning before starting |
-| Pool or dataset quota runs out of space | Stops with exit 3 and a plain message; no temporary files; data intact; failed files keep their access times; the folder's modified time is put back (it tries again for a few seconds while ZFS frees the abandoned copies' space) |
+| Pool or dataset quota runs out of space | Stops with exit 3 and a plain message. When a quota was the cause, it says a quota was reached and suggests raising it or freeing space, and never says the pool ran out of free space; no temporary files; data intact; failed files keep their access times; folder modified times are put back. ZFS only returns the abandoned copies' space when it writes out its next transaction group (`zfs_txg_timeout`, 5 seconds by default), so the run tries again for up to 15 seconds |
 | A user or group quota is reached (`zfs set userquota@bob=…`) while the dataset has room | Only that user's files are skipped ("over their quota"), and the run carries on. ZFS only updates quota usage as it writes out each transaction group, so for a few seconds after the quota trips, some of that user's files that would have fit are skipped too; a later `--resume` picks them up |
 | Dedup turned on for a child dataset inside the folder | Warning before starting that names that dataset |
 | `rebalance … >/tank/data/run.log` (the log file inside the folder) | `run.log` is left alone |
 | `--db` pointing at a file that isn't a rebalance progress file | Refuses with a friendly message; the file is untouched |
 | A folder named `-dash dir` given without `--` | Exit 2, and the message says to put `--` before it |
-| Two runs at once on the same folder with different `--db` files | Neither deletes the other's temporary files (they're reported as in use by another run and left alone). A file the other run is working on is skipped as busy, not as "changed"; no "hardlinks" skips; data identical. A file may be rewritten by both runs, one after the other, which is harmless |
-| A file locked by another program (`flock -x big/blob000.bin sleep 600 &`, then a run) | That file is skipped as busy ("another program or another rebalance run is working on it"), untouched (same inode and access time); exit 0. Once the lock is gone, `--resume` rewrites it |
+| Two runs at once on the same folder, with their `--db` files in different folders (two `--db` files in the same folder share one `run.lock`, so the second run refuses to start) | Neither deletes the other's temporary files (they're reported as in use by another run and left alone). A file the other run is working on is skipped as busy, not as "changed"; no "hardlinks" skips; data identical. A file may be rewritten by both runs, one after the other, which is harmless. Each run sees the other's renames as another program's, so some folders keep a new modified time; each run's end says how many ("N folders were changed by another program during the run, so their times were left as they are") |
+| A file locked by another program (`flock -x big/blob000.bin sleep 600 &`, then a run; on TrueNAS, see the note under the table) | That file is skipped as busy ("another program or another rebalance run is working on it"), untouched (same inode and access time); exit 0. Once the lock is gone, `--resume` rewrites it |
 | A file is written to while it's being copied | That file is skipped as "changed", and the new data is kept |
 | As a user who can write to the folder, swap a big file's hidden copy for a symlink to another file in the folder while it's being copied (root run) | The file is skipped and left as it was; the symlink's target keeps its content and times, because the copy's times are set through the open file, never by name |
 | `--halt-on-missing` and a file is deleted mid-run | Stops with exit 3 |
+
+On TrueNAS, start helpers like that `flock` inside tmux started without `sudo`, for example
+`tmux new -d -s lock "sudo flock -x big/blob000.bin sleep 600"`. Don't start them in the
+background of a `sudo` command (`sudo bash -c "flock … sleep 600 &"`): TrueNAS logs everything run
+with `sudo`, and once that `sudo` command ends, whatever it left running can't start programs. So
+`flock` fails with "Function not implemented", holds no lock, and the run rewrites the file as if
+nothing had locked it.
 
 ### 7. Permissions, attributes and flags
 
@@ -231,7 +251,7 @@ Make the data with `datagen.py --flags` (and `--acl nfs4` on TrueNAS), and run a
 | DOS no-unlink file (`dos-nounlink.bin`) | Skipped as protected from deletion, left exactly as it was, exit 0 |
 | `capability.bin` (`cap_net_raw=ep`) and `trusted.bin` (`trusted.lab`), made by `datagen.py --flags` | Rewritten (new inode) with the xattrs kept: `getcap` and `getfattr -n trusted.lab` show the same, and the manifest diff is identical |
 | The summary's skip line | Each label matches the files it counts: immutable or append-only, protected from deletion, project ID, permissions, owner, group and busy are counted separately |
-| TrueNAS SMB share (`aclmode=restricted`): setuid/setgid file with an explicit ACE (`owners/alice-setuid-ace`) | Skipped because its permissions can't be kept exactly; original untouched; exit stays 0 |
+| TrueNAS SMB share (`aclmode=restricted`): setuid/setgid file with an explicit ACE (`owners/alice-setuid-ace`) | Skipped, and counted under permissions that can't be kept exactly. Its `! skipped` line says plainly that its setuid/setgid bit can't be put back on a copy while it has ACL entries of its own, not a raw "operation not permitted". Original untouched; exit stays 0 |
 | While a copy is in progress, as another user | The hidden temporary file can't be read by anyone who couldn't read the original (its owner and ACL are set before any data is written). With `atime=on`, a user who may read the file and keeps opening the hidden copies (like a virus scanner would) doesn't change the rewritten file's access time |
 
 ### 8. TrueNAS and tmux
@@ -240,6 +260,11 @@ Make the data with `datagen.py --flags` (and `--acl nfs4` on TrueNAS), and run a
 |---|---|
 | Start `tmux` as `truenas_admin` (no sudo), then `sudo rebalance --vdev-report …` inside it; close the browser tab (or drop the SSH connection) mid-run and reattach | The run finishes and the before-and-after table is printed |
 | `sudo -i`, then `tmux`, then run; close the browser tab | Files are still rebalanced. Once sudo's session ends TrueNAS stops it starting `zfs` and `zpool`, so instead of the table it prints a friendly explanation (start tmux without sudo next time), never a raw error. It doesn't first say it's waiting for ZFS to free space, and if the block-cloning check during the run is blocked, it says so once |
+
+The same rule applies to the lab's own helpers on TrueNAS: anything started in the background
+under `sudo` (such as the `flock` in section 6, or a sampler loop) stops being able to run programs
+once that `sudo` command ends. Start them inside tmux started without `sudo`, with `sudo` inside
+the tmux command.
 
 ### 9. Version 1 side by side
 
@@ -256,35 +281,22 @@ the release notes the workflow would publish are pulled correctly from `CHANGELO
 
 ## Latest lab run
 
-**2026-10-03**, with the v2.0.0 release candidate, on:
+**2026-10-03** (round 3), with the v2.0.0 release candidate, on:
 
 - **Linux**: Ubuntu 24.04, OpenZFS 2.2.2 (block cloning on)
 - **TrueNAS**: TrueNAS SCALE 25.10.7, OpenZFS 2.3.9 (block cloning on, `atime=on` set by hand so
   the access-time checks mean something; new TrueNAS pools have it off)
 
-**Results:** 40 of 42 scenarios passed on Linux, and 12 of 14 on TrueNAS. The ones that failed
-were the Go test runs (as root and as an ordinary user on each VM). Most of those failures came
-from the tests themselves; one pointed at a small real weakness, now fixed:
-
-- `TestGroupNotYoursSkippedUnlessTheFolderGivesIt` never made its folder setgid, because Go's
-  `os.Chmod` ignores the raw `0o2000` bit. It now uses `os.ModeSetgid`. The real case, a file
-  whose group comes from its setgid folder (one the user isn't in), was rewritten correctly in the
-  run without `sudo`.
-- On TrueNAS, `TestExecRunner` tried to run a program from `/tmp`, which is mounted `noexec`. It
-  now uses `REBALANCE_TEST_DIR`, or skips where it can't run programs. (Going the other way, with
-  the temporary folder on ZFS, two `cmd` tests that expect a folder that isn't on ZFS failed; they
-  now treat the folder as not being on ZFS.)
-- On TrueNAS, `TestFolderTimesKeptWhenAnotherProgramChangesTheFolder` failed now and then. This
-  is the real weakness: if another program changed a folder within the same clock
-  tick as one of the run's own renames, the folder's old time could be put back. The folder's
-  entry count and link count are now compared too.
-- On OpenZFS 2.2.2, the project-ID refusal test skipped, because its helper turned on project
-  inheritance in a way that version rejects. It now does it the way ZFS accepts.
+**Results:** all 24 scenarios passed on Linux, and all 22 on TrueNAS. The Go tests had zero
+failures on both, as root and as an ordinary user, and as root the root-only and ZFS-only tests
+really ran. `TestFolderTimesKeptWhenAnotherProgramChangesTheFolder` passed 20 times in a row on ZFS
+and on `tmpfs`, as root and not. `bcloneused` stayed at 0 in every sample taken during the runs
+(499 on Linux, 594 on TrueNAS).
 
 The main runs, after adding an empty second mirror to a pool about half full:
 
-Linux: `sudo rebalance --vdev-report /tank/data/share` rebalanced 694 of 698 files (5.9 GiB) in
-55 seconds, at 113 MB/s.
+Linux: `sudo rebalance --vdev-report /tank/data/share` rebalanced 696 of 700 files (5.9 GiB) in
+54 seconds, at 115.2 MB/s.
 
 ```
 Before and after:
@@ -295,35 +307,37 @@ spread      51.4 pts -> 7.9 pts
 ```
 
 TrueNAS: `sudo rebalance --vdev-report /mnt/tank`, in tmux started without `sudo`, with the SSH
-connection dropped part-way, rebalanced 1,582 of 1,593 files (6.5 GiB) in 1m 05s, at 105.8 MB/s.
+connection killed part-way, rebalanced 1,615 of 1,622 files (6.3 GiB) in 1m 07s, at 101.1 MB/s.
+It carried on after the SSH connection went, and printed the table.
 
 ```
 Before and after:
 Pool tank   USED%            ALLOC CHANGE
-mirror-0    47.6% -> 19.6%       -2.7 GiB
-mirror-1     0.0% -> 27.9%       +2.7 GiB
-spread      47.6 pts -> 8.3 pts
+mirror-0    46.1% -> 19.4%       -2.5 GiB
+mirror-1     0.0% -> 26.8%       +2.5 GiB
+spread      46.1 pts -> 7.5 pts
 ```
 
-On both, the manifest diff was identical (content, owners, modes, nanosecond times, xattrs, POSIX
-and NFSv4 ACLs, flags, project IDs and DOS attributes), every rewritten file had a new inode, and
-`bcloneused` stayed at 0. The only file left alone that the skip file didn't expect was
-`flags/projdir/own-id.bin`, which is how the project-ID limit was found. It's now documented and
-in the skip file.
+On both, the manifest diff was identical: content, owners, modes, nanosecond times, xattrs, POSIX
+and NFSv4 ACLs, DOS flags, nodump, project IDs, capabilities and `trusted.*` xattrs. Every
+rewritten file had a new inode, and the files left alone were exactly the ones in the skip file.
 
-Changed since that run, so check these again next time (section numbers in brackets):
+The run also turned up some low-severity polish, all fixed afterwards. Check these again next time
+(section numbers in brackets):
 
-- the scripts: `manifest.py` no longer stops on immutable and append-only files, and
-  `datagen.py --flags` adds `own-id.bin` to the skip file and makes the capability and `trusted.*`
-  files (7)
-- the repeated folder-times test (1)
-- a rewritten hardlinked file's other names in its log line (4)
-- the exit code when output goes into `head`, and the second `--resume` message (5)
-- busy files and two runs at once, plain words for bad option values, folder times after a quota
-  stop, and a symlink swapped in for the hidden copy (6)
-- the summary's skip labels, and access times when something reads the hidden copy just before
-  the swap (7)
-- no "Waiting for ZFS" line when the tools are blocked, and the block-cloning check saying so (8)
+- folder times after a quota stop: ZFS gave the space back just after the old 5-second retry gave
+  up, so the run now keeps trying for up to 15 seconds (6)
+- the message when a quota stops the run now says a quota was reached, not that the pool ran out
+  of free space (6)
+- folders whose times were left alone because another program, or another run, changed them are
+  now counted, with a line at the end, instead of only showing with `--debug` (6)
+- `--checksum` followed by the folder now says the folder was taken as its value (6)
+- a default run now names the hardlinked files it skips, and after a `--process-hardlinks` run, a
+  plain `--resume` counts them as already done (4)
+- the skip line for a setuid or setgid file with ACL entries of its own on an SMB share (7)
+- `datagen.py --acl nfs4 --flags` on an SMB share, which stopped at `capability.bin`
+- this plan: the Go-test dataset needs POSIX ACLs (1), two `--db` files in the same folder share
+  one run lock (6), and on TrueNAS, helpers such as `flock` must run inside tmux (6, 8)
 
 ## Tidying up
 

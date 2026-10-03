@@ -153,20 +153,22 @@ class DatagenFlagsTest(unittest.TestCase):
         self.root = tempfile.mkdtemp()
         self.addCleanup(lambda: shutil.rmtree(self.root, ignore_errors=True))
 
-    def make(self, setcap=None, euid=0):
+    def make(self, setcap=None, euid=0, acl="none", tools=None, run=None, chmod=os.chmod):
         """Runs make_flag_files with chattr, setcap, ioctls and xattrs faked; returns the skip
-        list, the commands run and the xattrs set."""
+        list, the commands run and the xattrs set. tools maps other command names to their paths."""
         skip, xattrs = [], []
-        run = mock.MagicMock()
+        found = {"setcap": setcap, **(tools or {})}
+        run = run or mock.MagicMock()
         with mock.patch.object(datagen.sys, "platform", "linux"), \
                 mock.patch.object(datagen.subprocess, "run", run), \
                 mock.patch.object(datagen, "ioctl_u64", return_value=None), \
-                mock.patch.object(datagen.shutil, "which", side_effect=lambda t: setcap if t == "setcap" else None), \
+                mock.patch.object(datagen.shutil, "which", side_effect=found.get), \
                 mock.patch.object(datagen.os, "geteuid", return_value=euid), \
+                mock.patch.object(datagen.os, "chmod", side_effect=chmod), \
                 mock.patch.object(datagen.os, "setxattr", create=True,
                                   side_effect=lambda p, n, v, follow_symlinks=True: xattrs.append((p, n, v))), \
                 contextlib.redirect_stdout(io.StringIO()):
-            datagen.make_flag_files(self.root, skip)
+            datagen.make_flag_files(self.root, skip, acl)
         return skip, [c.args[0] for c in run.call_args_list], xattrs
 
     def rel(self, path):
@@ -198,6 +200,35 @@ class DatagenFlagsTest(unittest.TestCase):
         self.assertEqual(setcaps[0][1], "cap_net_raw=ep")
         self.assertEqual(self.rel(setcaps[0][2]), "flags/capability.bin")
         self.assertNotIn("security.capability", [n for _, n, _ in xattrs])
+
+    def test_capability_file_mode_on_a_restricted_share(self):
+        # On an aclmode=restricted dataset (a TrueNAS SMB share), a new file inherits a non-trivial
+        # ACL and chmod is refused until that ACL is stripped. --acl nfs4 --flags must still work.
+        stripped, modes = set(), {}
+
+        def run(cmd, **_):
+            if cmd[:2] == ["nfs4xdr_setfacl", "-b"]:
+                stripped.add(cmd[2])
+            return mock.MagicMock(returncode=0)
+
+        def restricted_chmod(path, mode):
+            if path not in stripped:
+                raise PermissionError(errno.EPERM, "Operation not permitted", path)
+            modes[path] = mode
+
+        cap = os.path.join(self.root, "flags/capability.bin")
+        _, cmds, _ = self.make(acl="nfs4", tools={"nfs4xdr_setfacl": "/usr/bin/nfs4xdr_setfacl"},
+                               run=mock.MagicMock(side_effect=run), chmod=restricted_chmod)
+        self.assertIn(["nfs4xdr_setfacl", "-b", cap], cmds)
+        self.assertEqual(modes.get(cap), 0o755)
+
+    def test_capability_file_mode_refused_without_nfs4(self):
+        # Without --acl nfs4 there's no ACL to strip, so a refused chmod is a real error.
+        def refuse(path, mode):
+            raise PermissionError(errno.EPERM, "Operation not permitted", path)
+
+        with self.assertRaises(PermissionError):
+            self.make(acl="none", chmod=refuse)
 
     def test_trusted_xattr_needs_root(self):
         _, _, xattrs = self.make(euid=1000)

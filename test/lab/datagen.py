@@ -6,7 +6,8 @@
 
 Writes incompressible data so ZFS compression can't hide allocation. Users 'alice' and 'bob' must exist.
 --acl nfs4 works on TrueNAS SMB-style datasets (aclmode=restricted), where chmod is refused while a file
-  has a non-trivial ACL: the ACL is stripped first, then the mode set, then the test ACEs added.
+  has a non-trivial ACL: the ACL is stripped first, then the mode set, then the test ACEs added. The
+  --flags files get the same strip-then-chmod treatment, without extra ACEs.
 --flags (Linux) adds files with inode flags (nodump, immutable, append-only), ZFS project IDs and, on
   ZFS, DOS attributes, plus a file with a capability (security.capability) and one with a trusted.*
   xattr, which must be rewritten with both kept. Immutable, append-only and no-unlink files can't be
@@ -94,7 +95,7 @@ def ioctl_u64(path, request, value=0):
         os.close(fd)
 
 
-def make_flag_files(root, skip):
+def make_flag_files(root, skip, acl):
     """Files whose inode flags, project IDs, DOS attributes, capabilities and trusted.* xattrs
     rebalance must keep (or, for the ones it can't replace, leave alone; those go in skip).
     Returns the changes to make once timestamps are set, since an immutable or append-only file
@@ -125,7 +126,7 @@ def make_flag_files(root, skip):
         write_random(f"{fl}/{name}", 100_000)
         later.append(lambda p=f"{fl}/{name}", f=flag: chattr(f, p))
         skip.append(f"flags/{name}")
-    make_xattr_files(fl)
+    make_xattr_files(fl, acl)
 
     # DOS attributes exist only on ZFS (OpenZFS 2.2+ on Linux); elsewhere they're simply not made.
     probe = f"{fl}/dos-hidden.bin"
@@ -144,12 +145,12 @@ def make_flag_files(root, skip):
     return later
 
 
-def make_xattr_files(fl):
+def make_xattr_files(fl, acl):
     """A file with a capability, as `setcap cap_net_raw=ep` sets it, and one with a trusted.* xattr,
     which only root can see or set. A root run must rewrite both and keep those xattrs."""
     cap = f"{fl}/capability.bin"
     write_random(cap, 100_000)
-    os.chmod(cap, 0o755)
+    set_mode(cap, 0o755, acl)
     try:
         if shutil.which("setcap"):
             subprocess.run(["setcap", "cap_net_raw=ep", cap], check=True)
@@ -292,7 +293,7 @@ def main():
         os.link(f"{h}/shared-outside", f"{a.outside}/partner")
         skip.append("links/shared-outside")
 
-    later = make_flag_files(root, skip) if a.flags else []
+    later = make_flag_files(root, skip, a.acl) if a.flags else []
 
     # deep tree
     d = root
