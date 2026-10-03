@@ -25,13 +25,18 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          # The newest Go 1.27 release, not the Go 1.26.0 that go.mod's "go" line alone would
+          # give: that one has security bugs in os.Root. make dist refuses anything older than
+          # go.mod's toolchain line.
+          go-version: "1.27.x"
           # Build release binaries from a clean slate, not from caches other runs wrote.
           cache: false
       - name: Tests
         run: go test ./...
       - name: Build the release files
-        run: make dist VERSION="$TAG"
+        run: |
+          make dist VERSION="$TAG"
+          go version dist/rebalance-*-amd64 dist/rebalance-*-arm64
       - name: Write the release notes from CHANGELOG.md
         run: |
           awk -v want="## [${TAG#v}]" '

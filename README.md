@@ -34,13 +34,19 @@ Linux systems or macOS they're the same, apart from where the program is install
 - **Set aside time.** It takes about as long as copying all the folder's data once. A progress
   line every minute tells you how long is left.
 - **Use tmux** (or `screen`), so closing the browser tab or SSH window doesn't stop it. tmux
-  keeps your session running in the background:
+  keeps your session running in the background. Start it as yourself, **without** `sudo` (and not
+  after `sudo -i`), then run `sudo rebalance …` inside it:
 
   ```sh
-  tmux           # start a session, then run rebalance inside it
+  tmux           # start a session as yourself, then run sudo rebalance inside it
                  # to leave it running, press Ctrl+B, then D
   tmux attach    # come back to it later
   ```
+
+  Why without sudo? TrueNAS keeps a log of everything run with `sudo`, and once the `sudo` that
+  started tmux has finished, programs still running inside it aren't allowed to start other
+  programs, so `rebalance` couldn't run `zpool` for its before-and-after table. (If that happens,
+  it tells you, and the files are still rebalanced.)
 
   Without tmux, a dropped connection stops the run safely (just like pressing Ctrl+C once), and
   you can carry on later with `--resume`.
@@ -57,9 +63,9 @@ curl -fsSL https://github.com/astundzia/go-zfs-rebalance/releases/latest/downloa
 `sudo` may ask for your password. The installer downloads the right program for your system,
 checks it against its published checksum, and puts it at `/root/.local/bin/rebalance`.
 
-Why there? TrueNAS keeps its system folders read-only, and won't run programs stored on your
-pools or in `/home`. Root's home folder is writable, can run programs, and is kept when TrueNAS
-updates. The installer never writes anything to your pools.
+Why there? TrueNAS keeps the system read-only and `/home` can't run programs, so it goes in root's
+home folder, which can, and which is kept when TrueNAS updates. The installer stays off your pools,
+so rebalancing never touches it.
 
 In the commands below, swap `/mnt/tank/media` for one of your own folders.
 
@@ -87,7 +93,7 @@ bigger it is, the more rebalancing will help. Close to 0 means your pool is alre
 ### 3. Start it
 
 ```sh
-tmux
+tmux           # as yourself, without sudo
 sudo /root/.local/bin/rebalance --vdev-report /mnt/tank/media
 ```
 
@@ -113,9 +119,10 @@ can't be rewritten is skipped or listed as failed, and is always left exactly as
 
 ### 4. Need to stop?
 
-Press **Ctrl+C** once, and it finishes the files it's working on, then stops. Press it again to
-stop right away. Either way is safe: a file is only swapped once its new copy is complete and
-checked, and a half-made copy is simply deleted.
+Press **Ctrl+C** once, and it finishes the files it's working on, then stops. Press it again (a
+second or more later) to stop right away. Either way is safe: a file is only swapped once its new
+copy is complete and checked, and a half-made copy is simply deleted. If it ever seems stuck, a
+third Ctrl+C quits at once; any half-made copy left behind is cleaned up by the next run.
 
 ```
 3:16:12 PM  ! Stopping after the files in progress… press Ctrl+C again to stop right away (still safe)
@@ -167,7 +174,8 @@ It's built to be. Each file is copied to a new hidden file in the same folder. T
 back and checked, given the same owner, permissions, attributes and times as the original, and
 only then swapped in, in a single step. The original isn't changed or removed before that swap.
 If anything goes wrong (an error, a power cut, Ctrl+C), the original stays as it was. If a file
-changes while it's being copied, it's skipped.
+changes while it's being copied, it's skipped. The hidden copy gets the original's owner and ACL
+before any data goes into it, so nobody can read it who couldn't read the original.
 
 Still, no tool is perfect. Keep a backup, and read [Safety details and limits](#safety-details-and-limits)
 for the few things it can't protect against.
@@ -176,11 +184,15 @@ for the few things it can't protect against.
 
 No. The owner, group, permissions (including setuid and setgid), extended attributes, ACLs
 (TrueNAS's NFSv4 and POSIX ACLs, and macOS ACLs) and the access and modified times are all
-copied, then checked before the swap. If any of them can't be copied exactly, the file is left
-alone and listed as failed.
+copied, then checked before the swap. On Linux, so are file flags such as nodump (`chattr +d`),
+ZFS project IDs, and the DOS attributes that SMB shares use (hidden, archive, read-only and so
+on). If any of them can't be copied exactly, the file is skipped: it's left exactly as it was,
+the summary at the end counts it, and the exit code stays 0.
 
-Run it with `sudo`. Only root can give a file someone else's owner, so without it, files owned by
-other users are skipped (and never changed).
+Run it with `sudo`. Only root can give a file someone else's owner. Without `sudo`, it only
+rewrites your own files: files owned by someone else, or whose group you're not in, are skipped
+before anything is copied, and so are files you aren't allowed to replace. They're never changed,
+not even their access times, and the summary tells you how to include them.
 
 What does change: the file's inode number (its internal ID), its "change time" (ctime) and its
 creation time. Any rewrite changes these. On macOS, file flags set with `chflags` (such as
@@ -223,8 +235,8 @@ tells you how many there were. Add `--process-hardlinks` to include them: the fi
 and every name is switched over to the new copy, so they stay linked together.
 
 If some of a file's names are outside the folder you gave, it's left alone, because rewriting only
-some of its names would split it into two separate copies. Point `rebalance` at a folder that
-holds all the names.
+some of its names would split it into two separate copies. Each of its names in the folder is
+listed in the log, so you can find it. Point `rebalance` at a folder that holds all the names.
 
 ### How long will it take?
 
@@ -236,10 +248,11 @@ shows an estimate, and you can stop and resume at any time.
 
 | You see | What it means | What to do |
 |---|---|---|
-| Not running as root | Files owned by other users will be skipped, never changed. | Run it with `sudo`. |
+| Not running as root | Only your own files will be rewritten. Files owned by other users, or that you aren't allowed to replace, are skipped before anything is copied, and never changed. | Run it with `sudo`. |
 | This folder isn't on ZFS | Rewriting files won't rebalance anything. | Check the folder. On TrueNAS, pools are under `/mnt`. |
+| The folder is on ZFS, but the zfs tools aren't available | Files can still be rewritten, but the snapshot and dedup checks and the tables are skipped. | Make sure `zfs` and `zpool` are installed and on the command search path. |
 | This dataset has snapshots | Every rewritten file is stored twice until those snapshots are gone. | Watch your free space, or delete snapshots you don't need first. |
-| Deduplication is on | It will be slow, and the new copies may point back at the old blocks, so the data may not move. | It's your call. Turning dedup off for the dataset first lets the data move. |
+| Deduplication is on | It will be slow, and the new copies may point back at the old blocks, so the data may not move. The warning lists every dataset in the folder that has it on, including ones mounted inside it. | It's your call. Turning dedup off for those datasets first lets the data move. |
 | Free space is tight | Copying several big files at once might run out of room. | Use a lower `--concurrency`, or free up some space. |
 | Found … files ending in .balance | Possible leftovers from version 1. | See [the .balance question](#i-used-version-1-what-are-these-balance-files). |
 | Found … temporary files … kept because of --no-cleanup | An earlier run was stopped hard (for example, killed or a power cut). | Run without `--no-cleanup` and they're removed. |
@@ -252,10 +265,11 @@ ready.
 
 ### What do the exit codes mean?
 
-`0` means it finished. `1` means some files couldn't be rewritten (each was left as it was). `2`
-means it didn't start, for example because of a typo in an option. `3` means it stopped early,
-because a file went missing (`--halt-on-missing`) or the pool ran out of space. `130` means it was
-stopped with Ctrl+C. See the [Exit codes](#exit-codes) table for details.
+`0` means it finished; skipped files don't count as failures. `1` means some files couldn't be
+rewritten (each was left as it was). `2` means it didn't start, for example because of a typo in an
+option. `3` means it stopped early, because a file went missing (`--halt-on-missing`) or the pool or
+dataset ran out of space. `130` means it was stopped with Ctrl+C. See the
+[Exit codes](#exit-codes) table for details.
 
 ### I used version 1. What are these .balance files?
 
@@ -285,8 +299,8 @@ curl -fsSL https://github.com/astundzia/go-zfs-rebalance/releases/latest/downloa
 ```
 
 If you installed it into a folder of your own, add `--dir` and that folder. Saved progress is
-left in `/root/.local/state/go-zfs-rebalance`. You can delete that folder if you won't use
-`rebalance` again.
+left in `/root/.local/state/go-zfs-rebalance` (`/var/root/.local/state/go-zfs-rebalance` on macOS).
+You can delete that folder if you won't use `rebalance` again.
 
 ### Does it work on macOS, Windows or TrueNAS CORE?
 
@@ -309,7 +323,8 @@ The quickest way, on TrueNAS SCALE, other Linux systems and macOS:
 curl -fsSL https://github.com/astundzia/go-zfs-rebalance/releases/latest/download/install.sh | sudo bash
 ```
 
-It needs root, and it works the same with `sudo sh`. It picks the right build for your system
+It needs root, and it works the same with `sudo sh`. Without root it stops, and shows the exact
+command to run instead (with the options you gave). It picks the right build for your system
 (Linux or macOS, amd64 or arm64), downloads it, checks its SHA-256 checksum, makes sure it starts,
 and then moves it into place in one step. If any of that fails, nothing is installed and an
 existing copy is kept. When it's done, it prints the next two commands to run.
@@ -319,10 +334,12 @@ Where it goes, unless you choose with `--dir`:
 | System | Folder |
 |---|---|
 | TrueNAS SCALE | `/root/.local/bin` (root's home folder, which is kept when TrueNAS updates) |
-| Other Linux, macOS | `/usr/local/bin`, or root's `.local/bin` if `/usr/local/bin` can't be used |
+| Other Linux | `/usr/local/bin`, or root's `.local/bin` if `/usr/local/bin` can't be used |
+| macOS | `/usr/local/bin`, which it creates if it isn't there yet |
 
-It never installs under `/mnt` unless you ask it to. On a Mac that has no `/usr/local/bin` yet,
-add `--dir /usr/local/bin` (see below) and the installer creates it.
+It never installs under `/mnt` unless you ask it to. Before it puts anything in place, it checks
+that the folder can run programs: a folder on a filesystem mounted `noexec` (such as `/home` and
+`/tmp` on TrueNAS) can't, and it tells you so and suggests another folder.
 
 Options (run it with `--help` to see them too):
 
@@ -360,12 +377,12 @@ base=https://github.com/astundzia/go-zfs-rebalance/releases/latest/download
 curl -fsSLO "$base/rebalance-linux-$arch"
 curl -fsSLO "$base/rebalance-linux-$arch.sha256"
 sha256sum -c "rebalance-linux-$arch.sha256"    # should say: OK
-chmod +x "rebalance-linux-$arch"
-sudo mv "rebalance-linux-$arch" /usr/local/bin/rebalance
+sudo install -m 755 -o root -g 0 "rebalance-linux-$arch" /usr/local/bin/rebalance
 ```
 
+`install` puts in a copy owned by root, so only root can change a program you'll run with `sudo`.
 On TrueNAS, `/usr/local/bin` is read-only, so use `/root/.local/bin` instead
-(`sudo mkdir -p /root/.local/bin` first).
+(`sudo install -d -m 755 /root/.local/bin` first).
 
 #### Manual download (macOS)
 
@@ -375,9 +392,8 @@ base=https://github.com/astundzia/go-zfs-rebalance/releases/latest/download
 curl -fsSLO "$base/rebalance-darwin-$arch"
 curl -fsSLO "$base/rebalance-darwin-$arch.sha256"
 shasum -a 256 -c "rebalance-darwin-$arch.sha256"    # should say: OK
-chmod +x "rebalance-darwin-$arch"
-sudo mkdir -p /usr/local/bin
-sudo mv "rebalance-darwin-$arch" /usr/local/bin/rebalance
+sudo install -d -m 755 -o root -g wheel /usr/local/bin
+sudo install -m 755 -o root -g wheel "rebalance-darwin-$arch" /usr/local/bin/rebalance
 ```
 
 Keep the downloaded file's name until after the check: the `.sha256` file refers to it by name.
@@ -397,7 +413,9 @@ commands above. Every release is listed on the
 
 #### From source
 
-You need Go 1.26 or newer. No C compiler is needed.
+You need Go 1.26 or newer, and no C compiler. Go 1.27.1 or newer is best: older Go releases have
+security bugs in `os.Root`, the part of Go that keeps `rebalance` inside the folder. With Go's
+default settings, an older Go downloads 1.27.1 for the build by itself.
 
 ```sh
 go install github.com/astundzia/go-zfs-rebalance/v2/cmd/rebalance@latest
@@ -475,14 +493,16 @@ In more detail:
 | `--size-threshold MB` | Only lists rewritten files of at least this many megabytes (MiB). Smaller files are still rewritten, and `--debug` lists them. | 0 (list all) |
 | `--halt-on-missing` | Stops the run if a file disappears before it's rewritten, instead of skipping it. | off |
 | `--filename-only` | Shows just file names in the log, without their folders. | off |
-| `--db FILE` | Keeps the saved progress in `FILE` instead of the usual place. | [see below](#where-progress-is-saved) |
+| `--db FILE` | Keeps the saved progress in `FILE` instead of the usual place. A fresh run only replaces `FILE` if it's a `rebalance` progress file; anything else is left alone, and the run stops with a message. | [see below](#where-progress-is-saved) |
 | `--debug` | Shows more detail, such as where progress is saved and why a check was skipped. | off |
 | `--version` | Prints the version. | |
 | `-h`, `--help` | Prints the help above. | |
 
 The tables (`--report` and `--vdev-report`) go to standard output. Everything else (the log,
 warnings and progress) goes to standard error. Colours are only used on a terminal, and never
-when `NO_COLOR` is set.
+when `NO_COLOR` is set. If you save the output to a file inside the folder you're rebalancing,
+that file is left alone. If the output goes to a program that quits early (such as `head`), the
+run stops gently, as if Ctrl+C had been pressed once.
 
 ### Reading the tables
 
@@ -509,45 +529,56 @@ Each folder gets its own progress file, recording which files have been rewritte
 | Run as | Folder |
 |---|---|
 | root (with `sudo`) on TrueNAS or Linux | `/root/.local/state/go-zfs-rebalance/` |
+| root (with `sudo`) on macOS | `/var/root/.local/state/go-zfs-rebalance/` |
 | your own user | `~/.local/state/go-zfs-rebalance/` |
 | anyone, with `XDG_STATE_HOME` set | `$XDG_STATE_HOME/go-zfs-rebalance/` |
 
-On macOS, `sudo` may keep your own home folder, in which case the files are in your
-`~/.local/state/go-zfs-rebalance/`. Add `--debug` to see the exact path. `--db FILE` puts the
-progress file somewhere else.
+With `sudo` (and no `XDG_STATE_HOME`) it uses root's own home folder, even where `sudo` keeps your
+`HOME` (as macOS does), so it never puts root-owned folders in your home. Add `--debug` to see the
+exact path. `--db FILE` puts the progress file somewhere else.
 
 How it's used:
 
 - **Without `--resume`**, a run starts fresh: that folder's saved progress is cleared first (with
-  a warning saying how much was cleared), and every file is rewritten once.
+  a warning saying how much was cleared), and every file is rewritten once. If a `--db` file held
+  progress for a different folder, the warning names that folder.
 - **With `--resume`**, files that are already done are skipped, so an interrupted run carries on
   where it stopped. Once everything is done, `--resume` simply says there's nothing to rebalance.
 - **`--passes N`** is the most times a file is rewritten in total, across resumed runs. One run
   never rewrites a file twice. With the default of 1, `--resume` finishes off a run. To rewrite
   everything a second time, use `--resume --passes 2`. Most people never need that.
 
-The same folder also holds `run.lock`, which makes sure only one `rebalance` runs at a time, so two
-runs can't trip over each other. (With `--db`, the lock sits next to that file instead.) It's
-safe to delete these files once you're done.
+The same folder also holds `run.lock`, which makes sure only one `rebalance` using that folder runs
+at a time. (With `--db`, the lock sits next to that file instead.) Runs that keep their progress
+somewhere else, such as another user's runs or ones with a different `--db`, aren't stopped by it,
+but they still can't trip over each other's files: a temporary copy that another run is still
+working on is never removed. It's safe to delete these files once you're done.
 
 ### How it works
 
 For each file, `rebalance`:
 
-1. **Copies it** into a new, hidden file in the same folder, named `.zfs-rebalance.<random>.tmp`.
-   It reads and writes every byte itself, so ZFS has to store the data on new blocks, spread
-   across all your vdevs. Long runs of zeros are skipped, so sparse files stay sparse.
-2. **Checks the copy**: makes sure it's on disk, reads it back, and compares its checksum with the
+1. **Makes an empty copy**: a new, hidden file in the same folder, named
+   `.zfs-rebalance.<random>.tmp`. Before any data goes in, it gets the original's owner, group,
+   ACL and permissions (without setuid or setgid for now), so nobody can read the copy who couldn't
+   read the original. Immutable and append-only files are skipped before this step.
+2. **Copies the data**. It reads and writes every byte itself, so ZFS has to store the data on new
+   blocks, spread across all your vdevs. Long runs of zeros are skipped, so sparse files stay
+   sparse. On Linux, the original is read without changing its access time.
+3. **Checks the copy**: makes sure it's on disk, reads it back, and compares its checksum with the
    original's.
-3. **Copies everything else**: the owner and group, extended attributes (which include ACLs on
-   Linux), permissions, and access and modified times, plus the ACL on macOS. setuid and setgid
-   are only set once the owner is right. Then it checks that they all match the original.
-4. **Makes sure nothing changed**: if the original was modified, replaced or moved while it was
+4. **Copies everything else**: the other extended attributes, setuid and setgid (only now that the
+   owner is right), file flags such as nodump, the ZFS project ID and DOS attributes, the ACL on
+   macOS, and last of all the access and modified times. Then it checks that they all match the
+   original.
+5. **Makes sure nothing changed**: if the original was modified, replaced or moved while it was
    being copied, the copy is thrown away and the file is skipped.
-5. **Swaps it in**, in one step: the copy is renamed over the original. At every moment, the name
+6. **Swaps it in**, in one step: the copy is renamed over the original. At every moment, the name
    points to either the complete original or the complete, checked copy.
-6. **Records it** in the progress file. Once a folder's files are done, its own modified time is
-   put back, so tools that watch folder times don't rescan everything.
+7. **Records it** in the progress file. Once a folder's files are done, its own modified time is
+   put back, so tools that watch folder times don't rescan everything. If something else changed
+   the folder in the meantime, its new time is left alone. If a time can't be put back, a warning
+   says so, and the summary counts those folders.
 
 If any step fails, or the run is stopped, the copy is deleted and the original is left exactly as
 it was.
@@ -562,8 +593,8 @@ recordsize.
 
 - **Block cloning is avoided.** On OpenZFS 2.2 and newer, an ordinary file copy can be done by
   "block cloning": the new file just points at the old blocks, so nothing moves. `rebalance`
-  copies the data itself so that can't happen. If the pool's block cloning counter grows during
-  a `--vdev-report` run anyway, a note says so.
+  copies the data itself so that can't happen. During a `--vdev-report` run, the pool's block
+  cloning counter is checked every 10 seconds, and a note says so if it ever grows.
 - **Files that are open for writing.** If a program changes a file while it's being copied, the
   file is skipped. But a program that already has the file open can still write to the old copy
   just after the swap, and that write would be lost. So stop apps that write to the folder (VMs,
@@ -574,15 +605,31 @@ recordsize.
   kept.
 - **Snapshots and deduplication** keep the old blocks in use. See the warnings in
   [the FAQ](#what-do-the-warnings-at-the-start-mean).
-- **File flags aren't copied.** Flags set with `chflags` on macOS (such as `hidden`) are lost.
-  Files that can't be replaced, such as immutable ones, are listed as failed and left alone.
-- **Hardlinks.** A hardlinked file with names outside the folder is skipped. If a run is stopped
-  hard (a second Ctrl+C or a power cut) while it's switching a hardlinked file's names over to the
-  new copy, those names may end up as separate, identical copies instead of links to one file. No
-  data is lost.
-- **Running out of space** stops the run (exit code 3), rather than failing every file after it.
+- **File flags.** On Linux, flags such as nodump (`chattr +d`), ZFS project IDs and ZFS DOS
+  attributes are kept. Immutable and append-only files (`chattr +i` / `+a`, or the ZFS
+  equivalents) can't be replaced, so they're skipped and left exactly as they were. On macOS,
+  flags set with `chflags` (such as `hidden`) aren't kept.
+- **Permissions that can't be kept exactly.** On TrueNAS SMB shares (`aclmode=restricted`), a
+  setuid or setgid file that also has ACL entries of its own can't get those bits back on a new
+  copy, so it's skipped and left untouched. Like every skipped file, it doesn't change the exit
+  code.
+- **Without `sudo`**, only your own files are rewritten: ones you own, with a group you're in.
+  Everything else is skipped before anything is copied.
+- **`trusted.*` extended attributes** (used by a few system tools, such as overlayfs) are only
+  visible to root. If your files have them, run it with `sudo`.
+- **Hardlinks.** A hardlinked file with names outside the folder is skipped, and its names are
+  listed in the log. If a run is stopped hard (a second Ctrl+C or a power cut) while it's
+  switching a hardlinked file's names over to the new copy, those names may end up as separate,
+  identical copies instead of links to one file. No data is lost.
+- **After a hard kill** (`kill -9`) or a power cut, the folders it was working in may keep a new
+  modified time. Nothing else changes, and the next run removes any leftover temporary files. A
+  second Ctrl+C doesn't have this problem.
+- **Running out of space.** If the pool or the dataset is full, the run stops (exit code 3) rather
+  than failing every file after it. If a user or group quota is reached while the dataset still
+  has room, only that owner's files are skipped, and the run carries on.
 - **It stays inside the folder.** It never follows a symlink out of it, and only ever removes its
-  own temporary files (`.zfs-rebalance.<12 hex digits>.tmp`).
+  own temporary files (`.zfs-rebalance.<12 hex digits>.tmp`), and never one that another run is
+  still using.
 - **Only Linux and macOS are supported.** On Windows, permissions, owners and alternate data
   streams can't be kept, so it refuses to run.
 
@@ -590,22 +637,24 @@ recordsize.
 
 | Code | Meaning |
 |---|---|
-| `0` | Finished. Files that were skipped (such as hardlinked ones) don't change this. |
+| `0` | Finished. Files that were skipped (such as hardlinked or immutable ones, other users' files without `sudo`, or ones whose permissions can't be kept exactly) don't change this. |
 | `1` | Some files couldn't be rewritten, and each was left as it was. Or the folder couldn't be read. |
 | `2` | Didn't start, so nothing was changed. For example: a mistake in the options, the folder doesn't exist, another run is in progress, a problem with the progress file, an unsupported system, or `--report` on a folder that isn't on ZFS. |
-| `3` | Stopped early: a file went missing (with `--halt-on-missing`), or the pool ran out of space. |
-| `130` | Stopped by Ctrl+C, by another stop signal, or because the terminal or SSH session closed. |
+| `3` | Stopped early: a file went missing (with `--halt-on-missing`), or the pool or dataset ran out of space. |
+| `130` | Stopped by Ctrl+C, by another stop signal, because the terminal or SSH session closed, or because the program reading its output (such as `head`) quit. |
 
 ### Building and testing
 
-You need Go 1.26 or newer and `make`. `make lint` also needs
-[shellcheck](https://www.shellcheck.net/).
+You need Go 1.26 or newer (1.27.1 or newer for release files, which `make dist` checks) and
+`make`. `make lint` also needs [shellcheck](https://www.shellcheck.net/). On Linux, `make test`
+also needs a C compiler (gcc or clang), because Go's race detector uses one there;
+`make test-short` doesn't.
 
 ```sh
 make build                   # bin/rebalance for this computer
 make test                    # all tests, with the race detector
 make test-short              # just the quick tests
-make lint                    # go vet (this system, Linux, Windows), staticcheck, shellcheck
+make lint                    # go vet (this system, Linux, macOS, Windows), staticcheck, shellcheck
 make dist VERSION=v2.0.0     # release files in dist/
 make help                    # list every target
 ```
@@ -613,16 +662,20 @@ make help                    # list every target
 `make dist` builds static programs for Linux and macOS (amd64 and arm64), each with a `.sha256`
 file, plus `checksums.txt` and `install.sh`.
 
-A few tests need root, and skip themselves otherwise. To run them:
+A few tests need root (and some need Linux), and skip themselves otherwise. Their names contain
+`Root`. To run them:
 
 ```sh
-go test -c -o /tmp/fileutil.test ./internal/fileutil
-(cd internal/fileutil && sudo /tmp/fileutil.test -test.run Root -test.v)
+for pkg in fileutil rebalance; do
+  go test -c -o "/tmp/$pkg.test" "./internal/$pkg"
+  (cd "internal/$pkg" && sudo "/tmp/$pkg.test" -test.run Root -test.v)
+done
 ```
 
 Every push and pull request is checked on GitHub Actions: vet, staticcheck and the race-enabled
-tests on Ubuntu and macOS, the root-only tests, and a full install test of `install.sh` against
-locally served release files.
+tests on Ubuntu and macOS; the root-only tests, as root on Ubuntu (the job fails unless at least
+one of them really ran as root); and installer tests on Ubuntu and macOS against locally served
+release files.
 
 ### How it's tested
 
@@ -631,10 +684,10 @@ slow and real:
 
 | Layer | Where | What it proves |
 |---|---|---|
-| **Unit tests** | `go test -race ./...`, on every push (Ubuntu and macOS) | The safe-swap steps one at a time: copies match byte for byte; owners, modes, times, xattrs and ACLs carry over; nothing is left behind when a copy is cancelled or fails; a file that changes mid-copy is left alone; symlinks and pipes planted where the temporary file goes are never followed; the copy can't take the block-cloning shortcut |
-| **Root-only tests** | CI, as root on Ubuntu | Ownership and setuid bits are kept for files owned by someone else |
-| **Whole-program tests** | `cmd/rebalance` tests, on every push | Options (including after the folder), exit codes, Ctrl+C and `--resume`, the run lock, friendly messages, escaping of strange file names, and the report tables against real `zpool list` output |
-| **Installer test** | CI | The one-line install, as root and not, against locally served release files; a bad checksum is refused |
+| **Unit tests** | `go test -race ./...`, on every push (Ubuntu and macOS) | The safe-swap steps one at a time: copies match byte for byte; the empty copy gets its owner and ACL before any data; owners, modes, times, xattrs and ACLs carry over; nothing is left behind when a copy is cancelled or fails, and the original's access time is unchanged; a file that changes mid-copy is left alone; symlinks and pipes planted where the temporary file goes are never followed; a temporary file another run is using is never removed; the copy can't take the block-cloning shortcut; a full quota is told apart from a full pool; other users' files are skipped up front without `sudo`; folder times are only put back when nothing else changed them |
+| **Root-only tests** | CI, as root on Ubuntu (the job fails unless at least one really ran as root) | Ownership and setuid bits are kept for files owned by someone else; inode flags (such as nodump) and project IDs are kept; immutable and append-only files are skipped and left alone |
+| **Whole-program tests** | `cmd/rebalance` tests, on every push | Options (including after the folder), exit codes, Ctrl+C timing, a closed output pipe and `--resume`, the run lock, where progress is saved under `sudo`, refusing a `--db` file that isn't a progress file, friendly messages and hints, escaping of strange file names, and the report tables against real `zpool list` output |
+| **Installer tests** | CI, on Ubuntu and macOS | The one-line install as root, and without root (it shows the exact command to run); folders mounted `noexec` noticed before anything runs or is created; a program that won't start; an install cut short by a closed output pipe; leftovers of an earlier install cleaned up; the TrueNAS and macOS default folders; a bad checksum is refused |
 | **Real-ZFS lab** | Before each release, on two VMs | Everything above on real pools: a Linux VM with OpenZFS 2.2 and a TrueNAS SCALE 25.10 VM with OpenZFS 2.3 |
 
 In the lab, each pool starts as one vdev about half full of deliberately awkward test data. A
@@ -642,9 +695,11 @@ second, empty vdev is added, and the tool is run the way a person would: install
 one-liner, then `--report`, then `--vdev-report`. A run only counts as a pass if every file's
 content, owner, mode, timestamps, xattrs and ACLs are identical afterwards, and every file has a
 new inode. The new inode is proof it was really written again. The pool's block-clone counter must
-not move, and the spread between vdevs has to drop. The lab also checks stopping and resuming, hardlinks,
-running out of space, files changing mid-copy, snapshots, reboots on TrueNAS, and a side-by-side
-run of version 1 to confirm its bugs are gone.
+not move, and the spread between vdevs has to drop. The lab also checks stopping and resuming
+(including a closed output pipe), hardlinks, running out of space and quotas, files changing
+mid-copy, snapshots, runs without `sudo`, file flags, project IDs and immutable files, two runs at
+once, tmux on TrueNAS, the installer on TrueNAS's `noexec` `/home`, reboots on TrueNAS, and a
+side-by-side run of version 1 to confirm its bugs are gone.
 
 The full test plan, the scripts, and how to build the lab yourself on any Linux machine with KVM
 are in [test/lab/README.md](test/lab/README.md).
@@ -660,10 +715,11 @@ are in [test/lab/README.md](test/lab/README.md).
    git push origin v2.0.1
    ```
 
-The release workflow runs the tests, builds the release files with `make dist`, and publishes a
-GitHub release with the binaries, `.sha256` files, `checksums.txt` and `install.sh`. The release
-notes are taken from that version's CHANGELOG section. A tag with a `-` in it, such as
-`v2.1.0-rc.1`, is published as a pre-release.
+The release workflow runs the tests, builds the release files with `make dist` using the newest
+Go 1.27 (older Go releases have security bugs in `os.Root`), and publishes a GitHub release with
+the binaries, `.sha256` files, `checksums.txt` and `install.sh`. The release notes are taken from
+that version's CHANGELOG section. A tag with a `-` in it, such as `v2.1.0-rc.1`, is published as
+a pre-release.
 
 ### Contributing
 

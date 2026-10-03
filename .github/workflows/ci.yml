@@ -19,6 +19,9 @@ defaults:
 env:
   # staticcheck 2026.2.1. Keep in sync with STATICCHECK in the Makefile.
   STATICCHECK: honnef.co/go/tools/cmd/staticcheck@v0.8.1
+  # The newest Go 1.27 release. Go 1.26.0 (what go.mod's "go" line alone would give) has
+  # security bugs in os.Root; go.mod's toolchain line names the oldest Go that's allowed.
+  GO_VERSION: "1.27.x"
 
 jobs:
   test:
@@ -34,13 +37,16 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_VERSION }}
       - name: go vet
         run: go vet ./...
-      - name: go vet (Linux)
-        run: GOOS=linux go vet ./...
+      - name: go vet (Linux amd64 and arm64, macOS arm64)
+        run: |
+          GOOS=linux GOARCH=amd64 go vet ./...
+          GOOS=linux GOARCH=arm64 go vet ./...
+          GOOS=darwin GOARCH=arm64 go vet ./...
       - name: go vet (Windows, which must still compile)
-        run: GOOS=windows go vet ./...
+        run: GOOS=windows GOARCH=amd64 go vet ./...
       - name: staticcheck
         run: go run "$STATICCHECK" ./...
       - name: Tests with the race detector
@@ -55,23 +61,50 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
-      # "sudo go test" trips over PATH and GOCACHE, so build the test binary first
-      # and run only that binary as root.
-      - name: Build the fileutil test binary
-        run: go test -race -c -o "$RUNNER_TEMP/fileutil.test" ./internal/fileutil
-      - name: Run the root-only tests as root
-        working-directory: internal/fileutil
+          go-version: ${{ env.GO_VERSION }}
+      # "sudo go test" trips over PATH and GOCACHE, so build the test binaries first
+      # and run only those binaries as root.
+      - name: Build the test binaries
         run: |
-          sudo "$RUNNER_TEMP/fileutil.test" -test.run Root -test.v -test.count=1 | tee "$RUNNER_TEMP/root-tests.log"
-          # These tests skip themselves when not root, so make sure they really ran.
-          if ! grep -q -- '--- PASS: .*Root' "$RUNNER_TEMP/root-tests.log"; then
-            echo "::error::No root-only test passed."
+          mkdir -p "$RUNNER_TEMP/tests"
+          go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' ./... >"$RUNNER_TEMP/tests/packages.txt"
+          while read -r pkg; do
+            [ -n "$pkg" ] || continue
+            go test -race -c -o "$RUNNER_TEMP/tests/$(printf '%s' "$pkg" | tr / _).test" "$pkg"
+          done <"$RUNNER_TEMP/tests/packages.txt"
+      - name: Run the root-only tests as root
+        run: |
+          # Root-only tests (named Test...Root...) skip themselves without root. So: run each
+          # package's Root tests as a normal user, run the ones that skipped again as root, and
+          # count a test only if it then passes. A broken sudo, or a skip that fires as root too,
+          # can't make this job pass, and tests that merely mention os.Root don't count.
+          ran=""
+          while read -r pkg; do
+            [ -n "$pkg" ] || continue
+            bin="$RUNNER_TEMP/tests/$(printf '%s' "$pkg" | tr / _).test"
+            dir=$(go list -f '{{.Dir}}' "$pkg")
+            if ! (cd "$dir" && "$bin" -test.run Root -test.v -test.count=1) </dev/null >"$bin.user.log" 2>&1; then
+              cat "$bin.user.log"
+              exit 1
+            fi
+            skipped=$(sed -n 's/^--- SKIP: \(Test[A-Za-z0-9_]*Root[A-Za-z0-9_]*\) .*/\1/p' "$bin.user.log")
+            [ -n "$skipped" ] || continue
+            pattern="^($(printf '%s\n' "$skipped" | paste -sd '|' -))\$"
+            (cd "$dir" && sudo "$bin" -test.run "$pattern" -test.v -test.count=1) </dev/null | tee "$bin.root.log"
+            for t in $skipped; do
+              if grep -q "^--- PASS: $t " "$bin.root.log"; then
+                ran="$ran $t"
+              fi
+            done
+          done <"$RUNNER_TEMP/tests/packages.txt"
+          if [ -z "$ran" ]; then
+            echo "::error::No root-only test ran as root: no '--- PASS: Test...Root...' line for a test that skips without root."
             exit 1
           fi
+          echo "Root-only tests that ran as root:$ran"
 
   installer:
-    name: Release build and installer smoke test (ubuntu)
+    name: Release build and installer tests (ubuntu)
     runs-on: ubuntu-latest
     env:
       BASE_URL: http://127.0.0.1:8000
@@ -81,13 +114,17 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_VERSION }}
+      # make dist also refuses binaries built with a Go older than go.mod's toolchain line.
       - name: Build the release files
-        run: make dist VERSION=ci
-      - name: shellcheck the installer and the lab script
+        run: |
+          make dist VERSION=ci
+          go version dist/rebalance-*-amd64 dist/rebalance-*-arm64
+      - name: shellcheck the installer and the lab script, and compile the lab's Python
         run: |
           shellcheck -s sh install.sh
           shellcheck test/lab/lab.sh
+          python3 -m py_compile test/lab/*.py
       - name: Serve dist/ on localhost
         run: |
           python3 -m http.server --directory dist --bind 127.0.0.1 8000 >"$RUNNER_TEMP/http.log" 2>&1 &
@@ -100,15 +137,24 @@ jobs:
           echo "::error::The local web server didn't start."
           cat "$RUNNER_TEMP/http.log"
           exit 1
-      - name: The installer refuses to run without root
+      - name: Without root the installer stops, and shows the command to run instead
         run: |
           for shell in sh bash; do
+            # From a saved file: the same file and options, with sudo.
             if REBALANCE_BASE_URL="$BASE_URL" "$shell" install.sh --dir /tmp/rb-nonroot >"$RUNNER_TEMP/nonroot.log" 2>&1; then
               echo "::error::install.sh ran without root under $shell."
               exit 1
             fi
             cat "$RUNNER_TEMP/nonroot.log"
-            grep -q 'sudo bash' "$RUNNER_TEMP/nonroot.log"
+            grep -qxF '  sudo sh install.sh --dir /tmp/rb-nonroot' "$RUNNER_TEMP/nonroot.log"
+            # Piped in: the one-liner, keeping --uninstall and --dir, and nothing about installing.
+            if "$shell" -s -- --uninstall --dir /tmp/rb-nonroot <install.sh >"$RUNNER_TEMP/nonroot.log" 2>&1; then
+              echo "::error::install.sh --uninstall ran without root under $shell."
+              exit 1
+            fi
+            cat "$RUNNER_TEMP/nonroot.log"
+            grep -qF '| sudo bash -s -- --uninstall --dir /tmp/rb-nonroot' "$RUNNER_TEMP/nonroot.log"
+            grep -qF 'nothing was removed' "$RUNNER_TEMP/nonroot.log"
           done
           test ! -e /tmp/rb-nonroot
       - name: Install as root into a chosen folder
@@ -117,6 +163,68 @@ jobs:
           /tmp/rb-bin/rebalance --version >"$RUNNER_TEMP/version.txt" 2>&1
           cat "$RUNNER_TEMP/version.txt"
           grep -qw ci "$RUNNER_TEMP/version.txt"
+      - name: Temporary files left by an earlier, stopped install are removed (only the installer's own)
+        run: |
+          sudo touch /tmp/rb-bin/.rebalance.AbCd1234 /tmp/rb-bin/.rebalance-check.Xy12Ab /tmp/rb-bin/.rebalance.NotOurs1
+          sudo chown "$(id -u)" /tmp/rb-bin/.rebalance.NotOurs1
+          sudo REBALANCE_BASE_URL="$BASE_URL" sh install.sh --dir /tmp/rb-bin | tee "$RUNNER_TEMP/stale.log"
+          grep -qF 'Removed 2 temporary files' "$RUNNER_TEMP/stale.log"
+          test ! -e /tmp/rb-bin/.rebalance.AbCd1234
+          test ! -e /tmp/rb-bin/.rebalance-check.Xy12Ab
+          test -e /tmp/rb-bin/.rebalance.NotOurs1
+          sudo rm /tmp/rb-bin/.rebalance.NotOurs1
+      - name: A closed output pipe (| head) leaves no temporary files, under dash and bash
+        run: |
+          for shell in sh bash; do
+            for _ in 1 2 3 4 5; do
+              sudo REBALANCE_BASE_URL="$BASE_URL" "$shell" install.sh --dir /tmp/rb-pipe 2>&1 | head -n 1 || true
+              if [ -n "$(sudo find /tmp/rb-pipe -name '.rebalance.*' 2>/dev/null)" ]; then
+                echo "::error::install.sh under $shell left a temporary file behind when its output closed."
+                sudo ls -la /tmp/rb-pipe
+                exit 1
+              fi
+            done
+          done
+      - name: A folder that can't run programs (noexec) is explained before anything is created
+        run: |
+          sudo mkdir -p "/mnt/rb noexec"
+          sudo mount -t tmpfs -o noexec,size=64m rbnoexec "/mnt/rb noexec"
+          # Once with findmnt, and once with a findmnt that fails, so /proc/self/mountinfo
+          # (with the space in the mount point escaped as \040) is read instead.
+          mkdir -p "$RUNNER_TEMP/no-findmnt"
+          printf '#!/bin/sh\nexit 1\n' >"$RUNNER_TEMP/no-findmnt/findmnt"
+          chmod 755 "$RUNNER_TEMP/no-findmnt/findmnt"
+          for path in "$PATH" "$RUNNER_TEMP/no-findmnt:$PATH"; do
+            if sudo env PATH="$path" REBALANCE_BASE_URL="$BASE_URL" sh install.sh --dir "/mnt/rb noexec/bin" >"$RUNNER_TEMP/noexec.log" 2>&1; then
+              echo "::error::install.sh installed into a noexec folder."
+              exit 1
+            fi
+            cat "$RUNNER_TEMP/noexec.log"
+            grep -qF '"noexec". Nothing was installed.' "$RUNNER_TEMP/noexec.log"
+            grep -qxF '  sudo sh install.sh --dir /usr/local/bin' "$RUNNER_TEMP/noexec.log"
+            test ! -e "/mnt/rb noexec/bin"
+          done
+          sudo umount "/mnt/rb noexec"
+      - name: A program that won't start is explained by its exit status alone, and leaves nothing behind
+        run: |
+          arch=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
+          asset=rebalance-linux-$arch
+          cp "dist/$asset" "$RUNNER_TEMP/good-program"
+          # Not a program at all, then one that is killed straight away with no output
+          # (what TrueNAS's sudo does to a program in a noexec folder).
+          for payload in 'not a program' '#!/bin/sh\nkill -9 $$'; do
+            printf '%b\n' "$payload" >"dist/$asset"
+            (cd dist && sha256sum "$asset" >"$asset.sha256")
+            if sudo REBALANCE_BASE_URL="$BASE_URL" sh install.sh --dir /tmp/rb-bad/bin >"$RUNNER_TEMP/bad.log" 2>&1; then
+              echo "::error::install.sh installed a program that doesn't start."
+              exit 1
+            fi
+            cat "$RUNNER_TEMP/bad.log"
+            grep -qF "couldn't be started from /tmp/rb-bad/bin" "$RUNNER_TEMP/bad.log"
+            test ! -e /tmp/rb-bad
+          done
+          cp "$RUNNER_TEMP/good-program" "dist/$asset"
+          (cd dist && sha256sum "$asset" >"$asset.sha256")
       - name: Install with the one-liner into the default folder, then uninstall
         run: |
           curl -fsSL "$BASE_URL/install.sh" | sudo REBALANCE_BASE_URL="$BASE_URL" bash
@@ -124,6 +232,17 @@ jobs:
           grep -qw ci "$RUNNER_TEMP/version.txt"
           curl -fsSL "$BASE_URL/install.sh" | sudo bash -s -- --uninstall
           test ! -e /usr/local/bin/rebalance
+      - name: On TrueNAS it goes in root's home, and says why
+        run: |
+          sudo mkdir /usr/share/truenas # this is how the installer recognises TrueNAS
+          curl -fsSL "$BASE_URL/install.sh" | sudo REBALANCE_BASE_URL="$BASE_URL" bash | tee "$RUNNER_TEMP/truenas.log"
+          sudo test -x /root/.local/bin/rebalance
+          test ! -e /usr/local/bin/rebalance
+          grep -qF "/home can't run programs" "$RUNNER_TEMP/truenas.log"
+          grep -qF "stays off your pools" "$RUNNER_TEMP/truenas.log"
+          curl -fsSL "$BASE_URL/install.sh" | sudo bash -s -- --uninstall
+          sudo test ! -e /root/.local/bin/rebalance
+          sudo rmdir /usr/share/truenas
       - name: The installer refuses a download that doesn't match its checksum
         run: |
           before=$(sha256sum </tmp/rb-bin/rebalance)
@@ -137,6 +256,87 @@ jobs:
           # The copy that was already installed is untouched, and no temp files are left behind.
           test "$(sha256sum </tmp/rb-bin/rebalance)" = "$before"
           test -z "$(find /tmp/rb-bin -name '.rebalance.*')"
+      - name: Uninstall from the chosen folder
+        run: |
+          sudo sh install.sh --uninstall --dir /tmp/rb-bin
+          test ! -e /tmp/rb-bin/rebalance
+
+  installer-macos:
+    name: Installer tests (macOS)
+    runs-on: macos-latest
+    env:
+      BASE_URL: http://127.0.0.1:8000
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Build the release files
+        run: make dist VERSION=ci
+      - name: Serve dist/ on localhost
+        run: |
+          python3 -m http.server --directory dist --bind 127.0.0.1 8000 >"$RUNNER_TEMP/http.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            if curl -fsS -o /dev/null "$BASE_URL/checksums.txt"; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::The local web server didn't start."
+          cat "$RUNNER_TEMP/http.log"
+          exit 1
+      - name: Without root the installer stops, and shows the command to run instead
+        run: |
+          if REBALANCE_BASE_URL="$BASE_URL" sh install.sh --dir /tmp/rb-nonroot >"$RUNNER_TEMP/nonroot.log" 2>&1; then
+            echo "::error::install.sh ran without root."
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/nonroot.log"
+          grep -qxF '  sudo sh install.sh --dir /tmp/rb-nonroot' "$RUNNER_TEMP/nonroot.log"
+          test ! -e /tmp/rb-nonroot
+      - name: Install as root into a chosen folder
+        run: |
+          sudo REBALANCE_BASE_URL="$BASE_URL" sh install.sh --dir /tmp/rb-bin
+          /tmp/rb-bin/rebalance --version | grep -qw ci
+      - name: A noexec disk image is explained before anything is created
+        run: |
+          hdiutil create -quiet -size 16m -fs HFS+ -volname rbnoexec "$RUNNER_TEMP/noexec.dmg"
+          dev=$(hdiutil attach -nomount "$RUNNER_TEMP/noexec.dmg" | awk '/Apple_HFS/ { print $1 }')
+          mkdir -p "$RUNNER_TEMP/rb noexec"
+          sudo diskutil mount -mountOptions noexec -mountPoint "$RUNNER_TEMP/rb noexec" "$dev"
+          mount | grep -F "$RUNNER_TEMP/rb noexec"
+          if sudo REBALANCE_BASE_URL="$BASE_URL" sh install.sh --dir "$RUNNER_TEMP/rb noexec/bin" >"$RUNNER_TEMP/noexec.log" 2>&1; then
+            echo "::error::install.sh installed into a noexec folder."
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/noexec.log"
+          grep -qF '"noexec". Nothing was installed.' "$RUNNER_TEMP/noexec.log"
+          grep -qxF '  sudo sh install.sh --dir /usr/local/bin' "$RUNNER_TEMP/noexec.log"
+          test ! -e "$RUNNER_TEMP/rb noexec/bin"
+          hdiutil detach "$dev"
+      - name: /usr/local/bin is created when it's missing, instead of using root's home
+        # /bin/bash, because a bash found through PATH might live in /usr/local/bin.
+        shell: /bin/bash -eo pipefail {0}
+        run: |
+          restore() {
+            if [ -e /usr/local/bin.ci-saved ]; then
+              sudo rm -rf /usr/local/bin
+              sudo mv /usr/local/bin.ci-saved /usr/local/bin
+            fi
+          }
+          trap restore EXIT
+          if [ -e /usr/local/bin ]; then
+            sudo mv /usr/local/bin /usr/local/bin.ci-saved
+          fi
+          /usr/bin/curl -fsSL "$BASE_URL/install.sh" | sudo REBALANCE_BASE_URL="$BASE_URL" /bin/bash | /usr/bin/tee "$RUNNER_TEMP/mac-default.log"
+          /usr/bin/grep -qF "isn't there yet, so the installer creates it" "$RUNNER_TEMP/mac-default.log"
+          test "$(/usr/bin/stat -f '%Su:%Lp' /usr/local/bin)" = "root:755"
+          /usr/local/bin/rebalance --version | /usr/bin/grep -qw ci
+          sudo test ! -e /var/root/.local/bin/rebalance
+          /usr/bin/curl -fsSL "$BASE_URL/install.sh" | sudo /bin/bash -s -- --uninstall
+          test ! -e /usr/local/bin/rebalance
       - name: Uninstall from the chosen folder
         run: |
           sudo sh install.sh --uninstall --dir /tmp/rb-bin

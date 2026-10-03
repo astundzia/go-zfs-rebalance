@@ -15,6 +15,8 @@ ONE_LINER="curl -fsSL $REPO_URL/releases/latest/download/install.sh | sudo bash"
 
 # The partly-downloaded program, removed on any exit until it has been moved into place.
 tmp_file=""
+# The topmost folder this install created, removed again (if still empty) when the install fails.
+created_dir=""
 
 say() { printf '%s\n' "$@"; }
 
@@ -27,6 +29,12 @@ die() {
 cleanup() {
 	if [ -n "$tmp_file" ]; then
 		rm -f "$tmp_file"
+	fi
+	if [ -n "$created_dir" ]; then
+		d=$install_dir
+		while rmdir "$d" 2>/dev/null && [ "$d" != "$created_dir" ]; do
+			d=${d%/*}
+		done
 	fi
 }
 
@@ -51,7 +59,8 @@ Environment variables (put them after sudo, e.g. "sudo INSTALL_DIR=/opt/bin bash
   REBALANCE_BASE_URL   download from this address instead of GitHub (for testing)
 
 Default folder:
-  TrueNAS     root's home folder, usually /root/.local/bin (it survives TrueNAS updates)
+  TrueNAS     root's home folder, usually /root/.local/bin (it's kept when TrueNAS updates)
+  macOS       /usr/local/bin (created if it isn't there yet)
   elsewhere   /usr/local/bin, or root's .local/bin if /usr/local/bin can't be used
 
 The installer needs root. It never installs anything onto your pools.
@@ -94,17 +103,65 @@ parse_args() {
 	done
 }
 
-require_root() {
-	if [ "$(id -u)" -ne 0 ]; then
-		die "The installer needs to run as root (with sudo), so it can put rebalance" \
-			"in a system folder. Nothing was installed." \
-			"" \
-			"Please run it again like this:" \
-			"" \
-			"  $ONE_LINER" \
-			"" \
-			"(If you ran a downloaded install.sh, put sudo in front of the same command.)"
+# quote prints $1 so it can be pasted into a shell as one word.
+quote() {
+	case $1 in
+	"" | *[!A-Za-z0-9_./:=@%+,-]*)
+		printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+		;;
+	*)
+		printf '%s' "$1"
+		;;
+	esac
+}
+
+# run_from_file reports whether this script was started from a saved file (sh install.sh)
+# rather than piped into the shell (curl ... | bash).
+run_from_file() {
+	case $0 in
+	*.sh) [ -f "$0" ] ;;
+	*) return 1 ;;
+	esac
+}
+
+# command_for prints the command that runs the installer again as root with the options
+# given this time. $1, if set, replaces the --dir folder.
+command_for() {
+	args=""
+	if [ "$opt_uninstall" = 1 ]; then
+		args="$args --uninstall"
 	fi
+	if [ -n "$opt_version" ]; then
+		args="$args --version $(quote "$opt_version")"
+	fi
+	dir=${1:-$opt_dir}
+	if [ -n "$dir" ]; then
+		args="$args --dir $(quote "$dir")"
+	fi
+	if run_from_file; then
+		printf 'sudo sh %s%s\n' "$(quote "$0")" "$args"
+	elif [ -n "$args" ]; then
+		printf '%s -s --%s\n' "$ONE_LINER" "$args"
+	else
+		printf '%s\n' "$ONE_LINER"
+	fi
+}
+
+require_root() {
+	if [ "$(id -u)" -eq 0 ]; then
+		return 0
+	fi
+	if [ "$opt_uninstall" = 1 ]; then
+		first="Removing rebalance needs root, so nothing was removed."
+	else
+		first="The installer needs root to put rebalance in place, so nothing was installed."
+	fi
+	again=$(command_for)
+	if run_from_file; then
+		die "$first" "" "Please run it again with sudo, like this:" "" "  $again"
+	fi
+	die "$first" "" "Please run it again with sudo, like this:" "" "  $again" "" \
+		"(If you ran a saved copy of install.sh, put sudo in front of that command instead.)"
 }
 
 detect_platform() {
@@ -180,7 +237,12 @@ choose_dir() {
 		esac
 	elif is_truenas; then
 		install_dir=$root_home/.local/bin
-		dir_note="TrueNAS keeps the system read-only and doesn't run programs from your pools or /home, so it goes in root's home, which survives updates."
+		dir_note="TrueNAS keeps the system read-only and /home can't run programs, so it goes in root's home folder, which is kept when TrueNAS updates. The installer stays off your pools, so rebalancing never touches it."
+	elif [ "$(uname -s)" = Darwin ]; then
+		install_dir=/usr/local/bin
+		if [ ! -d /usr/local/bin ]; then
+			dir_note="/usr/local/bin isn't there yet, so the installer creates it. macOS already looks for programs in it."
+		fi
 	elif [ -d /usr/local/bin ] && can_write /usr/local/bin; then
 		install_dir=/usr/local/bin
 	else
@@ -199,6 +261,144 @@ choose_dir() {
 				"Please choose a folder with --dir."
 			;;
 		esac
+	fi
+}
+
+# existing_folder prints the real path of $1, or of its nearest parent folder that exists.
+existing_folder() {
+	d=$1
+	while [ ! -d "$d" ]; do
+		d=${d%/*}
+		if [ -z "$d" ]; then
+			d=/
+		fi
+	done
+	(cd "$d" 2>/dev/null && pwd -P) || printf '%s\n' "$d"
+}
+
+# mount_options prints the mount options (comma-separated) of the filesystem that holds the
+# existing folder $1, or nothing if they can't be found out.
+mount_options() {
+	case $(uname -s) in
+	Linux)
+		if command -v findmnt >/dev/null 2>&1; then
+			opts=$(findmnt -n -o OPTIONS --target "$1" 2>/dev/null | head -n 1) || opts=""
+			if [ -n "$opts" ]; then
+				printf '%s\n' "$opts"
+				return 0
+			fi
+		fi
+		if [ -r /proc/self/mountinfo ]; then
+			# The mount point (field 5, with \040-style escapes) that is the longest prefix of
+			# the folder wins; of equal ones, the last, which is mounted on top. Field 6 holds
+			# the per-mount options, where noexec lives.
+			MOUNT_PATH=$1 awk '
+				function unescape(s,   out, i, c) {
+					out = ""
+					while ((i = index(s, "\\")) > 0) {
+						c = substr(s, i + 1, 3)
+						if (c ~ /^[0-7][0-7][0-7]$/) {
+							out = out substr(s, 1, i - 1) sprintf("%c", substr(c, 1, 1) * 64 + substr(c, 2, 1) * 8 + substr(c, 3, 1))
+							s = substr(s, i + 4)
+						} else {
+							out = out substr(s, 1, i)
+							s = substr(s, i + 1)
+						}
+					}
+					return out s
+				}
+				BEGIN { p = ENVIRON["MOUNT_PATH"]; best = -1 }
+				{
+					m = unescape($5)
+					if ((m == "/" || p == m || index(p, m "/") == 1) && length(m) >= best) {
+						best = length(m)
+						opts = $6
+					}
+				}
+				END { if (best >= 0) print opts }
+			' /proc/self/mountinfo
+		fi
+		;;
+	Darwin)
+		# df -P's last column is the mount point; it starts after the "Capacity" percentage.
+		mp=$(df -P "$1" 2>/dev/null | awk 'NR == 2 && match($0, / [0-9]+%[ \t]+/) { print substr($0, RSTART + RLENGTH) }') || mp=""
+		if [ -n "$mp" ]; then
+			# mount prints "<device> on <mount point> (<option>, <option>, ...)".
+			mount | MOUNT_PATH=$mp awk '
+				BEGIN { key = " on " ENVIRON["MOUNT_PATH"] " (" }
+				{
+					i = index($0, key)
+					if (i) {
+						opts = substr($0, i + length(key))
+						sub(/\)$/, "", opts)
+					}
+				}
+				END { gsub(/ /, "", opts); print opts }
+			'
+		fi
+		;;
+	esac
+}
+
+# other_dir prints a folder to suggest when $install_dir can't be used.
+other_dir() {
+	if [ "$install_dir" != /usr/local/bin ] && ! is_truenas; then
+		printf '%s\n' /usr/local/bin
+	elif [ "$install_dir" != "$root_home/.local/bin" ]; then
+		printf '%s\n' "$root_home/.local/bin"
+	else
+		printf '%s\n' /usr/local/bin
+	fi
+}
+
+# check_can_run_programs stops before anything is created when the install folder is on a
+# filesystem mounted "noexec", where no program can be started.
+check_can_run_programs() {
+	case ,$(mount_options "$(existing_folder "$install_dir")"), in
+	*,noexec,*)
+		die "Programs can't be run from $install_dir, because the filesystem it's on is mounted" \
+			"\"noexec\". Nothing was installed." \
+			"" \
+			"Please choose another folder, for example:" \
+			"" \
+			"  $(command_for "$(other_dir)")"
+		;;
+	esac
+}
+
+# make_install_dir creates $install_dir if needed, and remembers the topmost folder it made
+# so a failed install doesn't leave empty folders behind.
+make_install_dir() {
+	top=""
+	case $install_dir/ in
+	*/./* | */../* | *//*) ;; # unusual spelling: create it, but don't try to tidy up after
+	*)
+		d=$install_dir
+		while [ -n "$d" ] && [ ! -e "$d" ] && [ ! -h "$d" ]; do
+			top=$d
+			d=${d%/*}
+		done
+		;;
+	esac
+	mkdir -p "$install_dir" 2>/dev/null ||
+		die "Couldn't create the folder $install_dir. Please choose another one with --dir."
+	created_dir=$top
+}
+
+# remove_stale_temps deletes temporary files that an earlier, interrupted run of this
+# installer left in the install folder: root-owned regular files with the installer's names.
+remove_stale_temps() {
+	[ -d "$install_dir" ] || return 0
+	stale=0
+	for f in "$install_dir"/.rebalance.???????? "$install_dir"/.rebalance-check.??????; do
+		if [ -f "$f" ] && [ ! -h "$f" ] && [ -n "$(find "$f" -prune -type f -user 0 2>/dev/null)" ]; then
+			rm -f "$f" && stale=$((stale + 1))
+		fi
+	done
+	if [ "$stale" = 1 ]; then
+		say "  Removed a temporary file left behind by an earlier install that was stopped."
+	elif [ "$stale" -gt 1 ]; then
+		say "  Removed $stale temporary files left behind by an earlier install that was stopped."
 	fi
 }
 
@@ -268,17 +468,18 @@ do_install() {
 		say "  $dir_note"
 	fi
 
-	mkdir -p "$install_dir" 2>/dev/null ||
-		die "Couldn't create the folder $install_dir. Please choose another one with --dir."
+	check_can_run_programs
+	make_install_dir
 	if [ -d "$target" ]; then
 		die "There's a folder called $target, so rebalance can't be put there." \
 			"Please move that folder or choose another one with --dir."
 	fi
+	remove_stale_temps
 
 	# The temp file lives in the install folder, so the final mv is a single atomic rename.
 	tmp_file=$(mktemp "$install_dir/.rebalance.XXXXXXXX" 2>/dev/null) ||
 		die "Couldn't write to $install_dir (it may be read-only)." \
-			"Please choose another folder with --dir, for example: --dir $root_home/.local/bin"
+			"Please choose another folder with --dir, for example: --dir $(other_dir)"
 
 	say "Downloading $base_url/$asset"
 	fetch "$base_url/$asset" >"$tmp_file" ||
@@ -305,32 +506,30 @@ do_install() {
 
 	chmod 755 "$tmp_file"
 
-	# Try the new program before it replaces anything, so a folder that can't run
-	# programs (noexec) or a broken download never costs you a working copy.
+	# Try the new program before it replaces anything, so a folder that can't run programs
+	# or a broken download never costs you a working copy. Only the exit status counts: the
+	# shell's own error text depends on the language and on how sudo is set up.
 	rc=0
 	version_out=$("$tmp_file" --version 2>&1 </dev/null) || rc=$?
 	if [ "$rc" -ne 0 ]; then
-		case $version_out in
-		*"ermission denied"*)
-			other_dir=$root_home/.local/bin
-			if [ "$other_dir" = "$install_dir" ]; then
-				other_dir=/usr/local/bin
-			fi
-			die "The folder $install_dir can't run programs (it's probably mounted \"noexec\")," \
-				"so nothing was installed. Please choose another folder, for example:" \
-				"" \
-				"  $ONE_LINER -s -- --dir $other_dir"
-			;;
-		*)
-			die "The downloaded program didn't start on this computer, so nothing was installed." \
-				"It said: $version_out"
-			;;
-		esac
+		said=""
+		if [ -n "$version_out" ]; then
+			said="It said: $(printf '%s\n' "$version_out" | head -n 3)"
+		fi
+		die "The new program couldn't be started from $install_dir, so nothing was installed." \
+			"Usually that's because the folder isn't allowed to run programs, or a security setting" \
+			"(such as SELinux, AppArmor or a sudo policy) blocked it." \
+			${said:+"$said"} \
+			"" \
+			"Please try another folder, for example:" \
+			"" \
+			"  $(command_for "$(other_dir)")"
 	fi
 
 	mv -f "$tmp_file" "$target" ||
 		die "Couldn't move rebalance into $install_dir. Nothing was changed."
 	tmp_file=""
+	created_dir=""
 
 	version_line=$(printf '%s\n' "$version_out" | head -n 1)
 	say "" "Done! Installed $target"
@@ -346,8 +545,8 @@ do_install() {
 		"  2. Rebalance that folder, with a before-and-after table at the end:" \
 		"       sudo $target --vdev-report /mnt/tank/media" \
 		"" \
-		"Tip: type \"tmux\" first and run rebalance inside it. Then closing the browser tab or" \
-		"SSH session won't stop it, and \"tmux attach\" brings it back."
+		"Tip: type \"tmux\" first, as yourself (without sudo), and run the sudo command inside it." \
+		"Then closing the browser tab or SSH session won't stop it, and \"tmux attach\" brings it back."
 
 	case ":$PATH:" in
 	*":$install_dir:"*) ;;
@@ -364,7 +563,8 @@ do_install() {
 
 do_uninstall() {
 	target=$install_dir/rebalance
-	if [ -e "$target" ] || [ -L "$target" ]; then
+	remove_stale_temps
+	if [ -e "$target" ] || [ -h "$target" ]; then
 		rm -f "$target" || die "Couldn't remove $target."
 		say "Removed $target."
 	else
@@ -374,8 +574,9 @@ do_uninstall() {
 		fi
 	fi
 	say "" \
-		"Saved progress files (if any) are in $root_home/.local/state/go-zfs-rebalance and were left in place." \
-		"You can delete that folder if you won't use rebalance again."
+		"Saved progress (if any) was left in $root_home/.local/state/go-zfs-rebalance, and runs" \
+		"without sudo keep theirs in that user's ~/.local/state/go-zfs-rebalance." \
+		"You can delete those folders if you won't use rebalance again."
 }
 
 main() {
@@ -390,6 +591,10 @@ main() {
 	trap 'exit 130' INT
 	trap 'exit 143' TERM
 	trap 'exit 129' HUP
+	trap 'exit 131' QUIT
+	# Without this, a closed output pipe (sudo sh install.sh | head) kills dash before it can
+	# run the EXIT trap, leaving a temp file behind.
+	trap 'exit 141' PIPE
 
 	root_home=$(find_root_home)
 	choose_dir

@@ -6,20 +6,33 @@
 
 A snapshot records, per entry: type, size, sha256 (regular files), mode, uid, gid, atime_ns, mtime_ns,
 nlink, inode, symlink target, every xattr (including system.* ACL xattrs such as system.nfs4_acl_xdr and
-system.posix_acl_access) and, for directories, mtime_ns. It also lists leftover rebalance temp files.
+system.posix_acl_access; trusted.* ones are only visible to root) and, for directories, mtime_ns. On Linux
+it also records each file's and folder's inode flags (chattr: nodump, immutable, ...), project ID and
+xflags, and ZFS DOS attributes, where the filesystem has them. It also lists leftover rebalance temp files.
 
 diff exits 0 only if content and all metadata are identical. With --expect-rewritten it also requires that
 every regular file got a new inode (proof that it was physically rewritten), except files listed in the
 "skipped" set (hardlinks etc.) passed through --skip-file.
 """
+import fcntl
 import hashlib
 import json
 import os
 import re
 import stat
+import struct
 import sys
 
 TEMP_RE = re.compile(r"^\.zfs-rebalance\.[0-9a-f]{12}\.tmp$")
+
+# Linux ioctls (the same numbers on amd64 and arm64).
+FS_IOC_GETFLAGS = 0x80086601      # _IOR('f', 1, long)
+FS_IOC_FSGETXATTR = 0x801C581F    # _IOR('X', 31, struct fsxattr), 28 bytes
+ZFS_IOC_GETDOSFLAGS = 0x80088301  # OpenZFS include/sys/fs/zfs.h: _IOR(0x83, 1, uint64_t)
+# ZFS_DOS_FL_USER_VISIBLE: READONLY..NODUMP plus REPARSE, OFFLINE, SPARSE. ZFS also keeps
+# bookkeeping bits (such as AV_MODIFIED, set by every write) that aren't part of the file's
+# attributes.
+ZFS_DOS_USER_VISIBLE = 0x38FF00000000
 
 
 def xattrs(path):
@@ -34,6 +47,34 @@ def xattrs(path):
             out[name] = os.getxattr(path, name, follow_symlinks=False).hex()
         except OSError:
             pass
+    return out
+
+
+def inode_attrs(path):
+    """Inode flags, project ID and xflags, and ZFS DOS attributes; None where unsupported."""
+    out = {"flags": None, "xflags": None, "projid": None, "dosflags": None}
+    if not sys.platform.startswith("linux"):
+        return out
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return out
+    try:
+        for request, size in ((FS_IOC_GETFLAGS, 8), (FS_IOC_FSGETXATTR, 28), (ZFS_IOC_GETDOSFLAGS, 8)):
+            buf = bytearray(size)
+            try:
+                fcntl.ioctl(fd, request, buf)
+            except OSError:
+                continue
+            if request == FS_IOC_GETFLAGS:
+                out["flags"] = struct.unpack_from("I", buf)[0]
+            elif request == FS_IOC_FSGETXATTR:
+                xflags, _, _, projid = struct.unpack_from("IIII", buf)
+                out.update(xflags=xflags, projid=projid)
+            else:
+                out["dosflags"] = struct.unpack_from("Q", buf)[0] & ZFS_DOS_USER_VISIBLE
+    finally:
+        os.close(fd)
     return out
 
 
@@ -61,6 +102,8 @@ def snap(root):
                 "mtime_ns": st.st_mtime_ns, "nlink": st.st_nlink, "ino": st.st_ino,
                 "xattrs": xattrs(p),
             }
+            if stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode):
+                e.update(inode_attrs(p))
             if stat.S_ISREG(st.st_mode):
                 e.update(type="file", size=st.st_size, sha256=sha256(p), atime_ns=st.st_atime_ns,
                          blocks=st.st_blocks)
@@ -87,7 +130,8 @@ def diff(a, b, expect_rewritten, skip):
     rewritten = kept = 0
     for rel in sorted(set(ea) & set(eb)):
         x, y = ea[rel], eb[rel]
-        for k in ("type", "size", "sha256", "mode", "uid", "gid", "mtime_ns", "nlink", "target", "xattrs"):
+        for k in ("type", "size", "sha256", "mode", "uid", "gid", "mtime_ns", "nlink", "target", "xattrs",
+                  "flags", "xflags", "projid", "dosflags"):
             if x.get(k) != y.get(k):
                 problems.append(f"{k} changed: {rel!r}: {x.get(k)!r} -> {y.get(k)!r}")
         if x["type"] == "file" and x.get("atime_ns") != y.get("atime_ns"):

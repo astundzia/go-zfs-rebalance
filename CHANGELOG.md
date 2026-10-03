@@ -16,8 +16,9 @@ nothing at all. All of that is fixed. If you use version 1, please upgrade.
 - **Safer rewrites.** Each file is copied, checked, and then swapped in, in a single step. The
   original is never removed first, so a crash or Ctrl+C can't lose it.
 - **Everything about a file is kept**: owner, group, permissions, extended attributes, ACLs
-  (including TrueNAS's NFSv4 ACLs) and timestamps. If anything can't be kept exactly, the file is
-  left alone.
+  (including TrueNAS's NFSv4 ACLs) and timestamps, plus, on Linux, file flags such as nodump, ZFS
+  project IDs and DOS attributes. If anything can't be kept exactly, the file is skipped and left
+  exactly as it was.
 - **Stop and carry on later** with Ctrl+C and `--resume`.
 - **See the difference** with `--report` and `--vdev-report`, which show how full each vdev is.
 - **One-line installer** for TrueNAS SCALE, Linux and macOS.
@@ -47,24 +48,48 @@ nothing at all. All of that is fixed. If you use version 1, please upgrade.
 ### Added
 
 - `--resume` carries on where an earlier run for the same folder stopped. Progress is now saved
-  in `~/.local/state/go-zfs-rebalance/` (root's home when run with `sudo`), one file per folder.
-- `--db FILE` keeps the progress somewhere else.
+  in `~/.local/state/go-zfs-rebalance/`, one file per folder. With `sudo` that's root's own home
+  folder, even on macOS, where `sudo` keeps your `HOME`.
+- `--db FILE` keeps the progress somewhere else. A fresh run only replaces `FILE` if it's a
+  `rebalance` progress file; any other file is left alone, and the run stops with a message.
 - `--report` shows how full each vdev in the pool is, and the "spread" between the fullest and
   emptiest one, then exits without changing anything.
 - `--vdev-report` shows that table at the start, and a before-and-after comparison at the end,
   even after Ctrl+C. It waits for ZFS to finish freeing space first, and adds notes about
-  snapshots holding old data or block cloning.
+  snapshots holding old data or block cloning (checked every 10 seconds during the run).
 - Safety checks before starting, as friendly warnings: not running as root, the folder isn't on
-  ZFS, snapshots exist, deduplication is on, free space looks tight, `.balance` leftovers from
-  version 1, and kept temporary files.
+  ZFS (or the zfs tools aren't available), snapshots exist, deduplication is on (for the folder's
+  dataset or any dataset inside it), free space looks tight (judged by the space files really
+  take, so sparse files don't set it off), `.balance` leftovers from version 1, and kept temporary
+  files.
 - Hardlinked files can be rewritten together with `--process-hardlinks`. A hardlinked file with
-  names outside the folder is left alone.
+  names outside the folder is left alone, and its names are listed in the log.
 - A progress line every minute, with an estimate of the time left, and a summary at the end that
   says what to do next.
-- Only one run at a time, so two runs can't trip over each other.
+- Only one run at a time per progress folder, and a run never removes a temporary file that
+  another run is still using.
+- Runs without `sudo` only rewrite your own files. Files owned by someone else, or that you
+  aren't allowed to replace, are skipped before anything is copied, and the summary says how to
+  include them.
+- Immutable and append-only files (`chattr +i` / `+a`, or the ZFS equivalents) are skipped and
+  left alone.
+- When a user or group quota is reached, only that owner's files are skipped and the run carries
+  on. A full pool or dataset still stops the run.
+- Stopping is gentler and clearer: a second Ctrl+C only stops right away if it comes a second or
+  more after the first, a third quits at once, and the messages say what is being stopped
+  (scanning, copying, or waiting for ZFS). Output piped into a program that quits early, such as
+  `head`, stops the run gently.
+- On TrueNAS, if `zfs` and `zpool` can't be started because the `sudo` session that started the
+  run has ended, a friendly message explains it (start tmux without `sudo`, then run
+  `sudo rebalance` inside it) instead of a raw error.
+- If you save the output to a file inside the folder being rebalanced, that file is left alone.
+- An unknown option that looks like a folder name starting with `-` gets a hint to put `--` before
+  it.
 - `install.sh`, a one-line installer (`curl … | sudo bash`, see the README). It checks the
-  download's checksum, and on TrueNAS installs into `/root/.local/bin`, never onto your pools. It
-  can also install a given version, or uninstall.
+  download's checksum and that the folder can run programs, and on TrueNAS installs into
+  `/root/.local/bin`, never onto your pools. On macOS it creates `/usr/local/bin` if it's missing.
+  Without root, it shows the exact command to run, keeping the options you gave. It can also
+  install a given version, or uninstall.
 - Releases now include `install.sh` and a `checksums.txt` covering every file.
 - Automatic checks on every change (tests on Linux and macOS, root-only tests, an installer test)
   and automatic releases from version tags.
@@ -83,7 +108,8 @@ nothing at all. All of that is fixed. If you use version 1, please upgrade.
   writes new blocks.
 - **Owners, extended attributes, ACLs and access times were lost.** Run as root, every file became
   owned by root and lost its ACL, even though the docs said they were kept. They are now copied,
-  then checked before the swap.
+  then checked before the swap. On Linux, a file that's skipped or fails also keeps its access
+  time, because the original is read without updating it.
 - Changes made to a file while it was being copied were lost. They are now noticed, and the file
   is skipped.
 - When a file couldn't be rescued after an error, the program still said it had been saved.
@@ -118,8 +144,12 @@ nothing at all. All of that is fixed. If you use version 1, please upgrade.
 - Log lines mangled file names containing " at " or ":", and dropped the reason for errors.
 - Colour codes were written even when the output wasn't a terminal.
 - Every folder's modified time changed. Now each folder gets its times back once its files are
-  done, so tools that watch folder times don't rescan everything.
+  done, so tools that watch folder times don't rescan everything. A folder that something else
+  changed in the meantime keeps its new time, and if a time can't be put back, the summary says
+  so.
 - The README's macOS checksum steps didn't work.
+- Skip counts in the summary now read properly ("1 leftover .balance file", "2 leftover .balance
+  files").
 
 ### Security
 
@@ -130,6 +160,15 @@ nothing at all. All of that is fixed. If you use version 1, please upgrade.
   followed, so a root run could overwrite any file it pointed to. Temporary files now have random
   names, are created only if nothing is there, never follow symlinks, and must be regular files.
   All file access stays inside the folder being rebalanced.
+- **The temporary copy could be read by others.** It now gets the original's owner, ACL and
+  permissions before any data is written into it, so nobody can read it who couldn't read the
+  original.
+- **Release programs are built with Go 1.27.1 or newer.** Go 1.26.0 has security bugs in `os.Root`
+  (GO-2026-4970, GO-2026-4602), which `rebalance` relies on to stay inside the folder. go.mod now
+  names that toolchain, CI and releases use the newest Go 1.27, and `make dist` refuses anything
+  older.
+- **The manual install steps left a program your own account could change, then run as root.** The
+  README now uses `sudo install -o root`, as the installer and `sudo make install` already did.
 - **Terminal escape codes in file names.** File names were printed as they were, so a crafted name
   could send control codes to your terminal. Unusual characters are now shown escaped.
 - Updated the test library, which pulled in a version of yaml.v3 with a known vulnerability
