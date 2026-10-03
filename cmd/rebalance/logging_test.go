@@ -61,13 +61,19 @@ func TestFormatterLines(t *testing.T) {
 			"3:04:05 PM      old/x.balance\n"},
 		{"rebalanced hardlinked file", logrus.InfoLevel, "Rebalanced, keeping its 3 hardlinked names together",
 			logrus.Fields{"op": "rebalanced", "path": "links/a", "names": []string{"links/a", "links/b", "c"}, "size": int64(5)},
-			"3:04:05 PM  ✓ rebalanced  links/a (+2 hardlinked names)  5 B\n"},
+			"3:04:05 PM  ✓ rebalanced  links/a (also named links/b, c)  5 B\n"},
+		{"hardlinked file with four names", logrus.InfoLevel, "Rebalanced, keeping its 4 hardlinked names together",
+			logrus.Fields{"op": "rebalanced", "path": "a", "names": []string{"a", "b", "c", "d"}, "size": int64(5)},
+			"3:04:05 PM  ✓ rebalanced  a (also named b, c, d)  5 B\n"},
+		{"hardlinked file with many names", logrus.InfoLevel, "Rebalanced, keeping its 6 hardlinked names together",
+			logrus.Fields{"op": "rebalanced", "path": "a", "names": []string{"a", "b", "c", "d", "e", "f"}, "size": int64(5)},
+			"3:04:05 PM  ✓ rebalanced  a (also named b, c, d, +2 more)  5 B\n"},
 		{"skipped hardlinked file", logrus.InfoLevel, "Skipped",
 			logrus.Fields{"op": "skipped", "path": "a", "names": []string{"a", "b"}, "reason": "the file's hardlinks changed"},
-			"3:04:05 PM  ! skipped  a (+1 hardlinked name)  the file's hardlinks changed\n"},
+			"3:04:05 PM  ! skipped  a (also named b)  the file's hardlinks changed\n"},
 		{"failed hardlinked file", logrus.ErrorLevel, "Couldn't rebalance",
 			logrus.Fields{"op": "failed", "path": "a", "names": []string{"a", "b"}, "reason": "r"},
-			"3:04:05 PM  ✗ failed  a (+1 hardlinked name)  r\n"},
+			"3:04:05 PM  ✗ failed  a (also named b)  r\n"},
 	}
 	f := &logFormatter{}
 	for _, tt := range tests {
@@ -100,23 +106,32 @@ func TestFormatterEscapesText(t *testing.T) {
 	}
 }
 
-// TestFormatterListsHardlinkedNamesWithDebug checks that --debug lists every name of a hardlinked
-// file, escaped, below its line.
-func TestFormatterListsHardlinkedNamesWithDebug(t *testing.T) {
+// TestFormatterListsHardlinkedNames checks that a hardlinked file's line shows its other names,
+// escaped, and that --debug lists the ones that don't fit below it.
+func TestFormatterListsHardlinkedNames(t *testing.T) {
+	names := []string{"a/x", "b/y\x1b", "z", "w", "v", "u"}
 	var buf syncBuffer
 	log := newLogger(&buf, true, false)
-	log.WithFields(logrus.Fields{"op": "rebalanced", "path": "a/x", "names": []string{"a/x", "b/y\x1b", "z"}, "size": int64(1)}).Info("Rebalanced")
+	log.WithFields(logrus.Fields{"op": "rebalanced", "path": "a/x", "names": names, "size": int64(1)}).Info("Rebalanced")
 	lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
-	if len(lines) != 3 || !strings.HasSuffix(lines[0], "✓ rebalanced  a/x (+2 hardlinked names)  1 B") ||
-		!strings.HasSuffix(lines[1], "      also b/y\\x1b") || !strings.HasSuffix(lines[2], "      also z") {
-		t.Errorf("got:\n%s", buf.String())
+	if len(lines) != 3 || !strings.HasSuffix(lines[0], "✓ rebalanced  a/x (also named b/y\\x1b, z, w, +2 more)  1 B") ||
+		!strings.HasSuffix(lines[1], "      also v") || !strings.HasSuffix(lines[2], "      also u") {
+		t.Errorf("with --debug, got:\n%s", buf.String())
 	}
 
 	buf = syncBuffer{}
 	log = newLogger(&buf, false, false)
-	log.WithFields(logrus.Fields{"op": "rebalanced", "path": "a/x", "names": []string{"a/x", "z"}, "size": int64(1)}).Info("Rebalanced")
-	if strings.Contains(buf.String(), "also") {
-		t.Errorf("names listed without --debug: %q", buf.String())
+	log.WithFields(logrus.Fields{"op": "rebalanced", "path": "a/x", "names": names, "size": int64(1)}).Info("Rebalanced")
+	if got := buf.String(); strings.Count(got, "\n") != 1 || !strings.HasSuffix(got, "✓ rebalanced  a/x (also named b/y\\x1b, z, w, +2 more)  1 B\n") {
+		t.Errorf("without --debug, got:\n%s", got)
+	}
+
+	// When every name fits on the line, --debug adds nothing.
+	buf = syncBuffer{}
+	log = newLogger(&buf, true, false)
+	log.WithFields(logrus.Fields{"op": "rebalanced", "path": "a/x", "names": names[:4], "size": int64(1)}).Info("Rebalanced")
+	if got := buf.String(); strings.Count(got, "\n") != 1 || strings.Contains(got, "more") {
+		t.Errorf("four names with --debug, got:\n%s", got)
 	}
 }
 
@@ -124,6 +139,10 @@ func TestFormatterFilenameOnly(t *testing.T) {
 	f := &logFormatter{filenameOnly: true}
 	got := format(t, f, logrus.InfoLevel, "Rebalanced", logrus.Fields{"op": "rebalanced", "path": "photos/2024/IMG 1.jpg", "size": int64(3)})
 	if want := "3:04:05 PM  ✓ rebalanced  IMG 1.jpg  3 B\n"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	got = format(t, f, logrus.InfoLevel, "Rebalanced", logrus.Fields{"op": "rebalanced", "path": "a/x", "names": []string{"a/x", "b/y"}, "size": int64(3)})
+	if want := "3:04:05 PM  ✓ rebalanced  x (also named y)  3 B\n"; got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
 	got = format(t, f, logrus.WarnLevel, "", logrus.Fields{"op": opListed, "path": "a/b/c\n.balance"})

@@ -196,7 +196,8 @@ func TestBadArgumentsExitTwo(t *testing.T) {
 	}{
 		{"two folders", []string{dir, dir}, "please give just one folder"},
 		{"passes 0", []string{dir, "--passes", "0"}, "A normal run already rewrites every file once"},
-		{"unknown checksum", []string{"--checksum", "foo", dir}, `"foo" isn't a checksum this tool knows; use sha256 (the default) or md5`},
+		{"unknown checksum", []string{"--checksum", "foo", dir}, `--checksum needs sha256 (the default) or md5, not "foo"`},
+		{"concurrency not a number", []string{dir, "--concurrency", "abc"}, `--concurrency needs a whole number, like 4, not "abc"`},
 		{"negative size threshold", []string{dir, "--size-threshold", "-5"}, "--size-threshold can't be negative"},
 		{"unknown option", []string{dir, "--nope"}, "there's no option called --nope"},
 		{"folder missing", []string{filepath.Join(dir, "missing")}, "doesn't exist"},
@@ -480,6 +481,18 @@ func TestUnwritableFolderIsSkippedWithoutRoot(t *testing.T) {
 		t.Error("the skipped file was changed")
 	}
 	checkTree(t, root, []string{"ok.txt", "ro/locked.txt"})
+
+	// Resuming tries the skipped file again, and says plainly that there was nothing new to do.
+	code, _, errOut = runCLI(t, "--resume", root)
+	if code != exitOK {
+		t.Fatalf("resumed run: exit %d, want 0", code)
+	}
+	mustContain(t, errOut, "! skipped  ro/locked.txt  no permission to replace it",
+		"Nothing new to rebalance: the remaining file was skipped again (1 file you aren't allowed to replace).",
+		"Skipped 2 files: 1 already done, 1 file you aren't allowed to replace.",
+		"To include the 1 file you don't have permission to change, run it again with sudo")
+	mustNotContain(t, errOut, "Finished")
+	checkTree(t, root, []string{"ok.txt", "ro/locked.txt"})
 }
 
 func TestLeftoversAreReported(t *testing.T) {
@@ -528,6 +541,30 @@ func TestLeftoversAreReported(t *testing.T) {
 	}
 }
 
+// TestHardlinkedNamesAreShown checks that a rewritten hardlinked file's line shows its other names
+// without --debug, and that without --process-hardlinks it is skipped with a hint.
+func TestHardlinkedNamesAreShown(t *testing.T) {
+	isolateState(t)
+	root := makeTree(t, "a", "links/b")
+	for _, name := range []string{"links/c", "links/d", "links/e", "z"} {
+		if err := os.Link(filepath.Join(root, "links/b"), filepath.Join(root, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	code, _, errOut := runCLI(t, root, "--no-random")
+	if code != exitOK {
+		t.Fatalf("exit %d, want 0", code)
+	}
+	mustContain(t, errOut, "rebalanced 1 file", "Skipped 5 files: 5 hardlinked.", "To include the 5 files with hardlinks, add --process-hardlinks.")
+
+	code, _, errOut = runCLI(t, root, "--no-random", "--process-hardlinks")
+	if code != exitOK {
+		t.Fatalf("exit %d, want 0", code)
+	}
+	mustContain(t, errOut, "✓ rebalanced  links/b (also named links/c, links/d, links/e, +1 more)  ", "rebalanced 6 files")
+	mustNotContain(t, errOut, "      also z")
+}
+
 func TestFolderNameStartingWithADash(t *testing.T) {
 	isolateState(t)
 	parent := tempDir(t)
@@ -540,9 +577,21 @@ func TestFolderNameStartingWithADash(t *testing.T) {
 	mustContain(t, errOut, "Rebalancing "+filepath.Join(parent, "-dir"), "rebalanced 1 file")
 }
 
+// treatAsNotZFS makes the run see root as a folder that isn't on ZFS. The kernel is asked as usual,
+// unless root really is on ZFS (as with TMPDIR on a TrueNAS pool); then it is made to say no.
+func treatAsNotZFS(t *testing.T, root string) {
+	t.Helper()
+	if on, err := zfs.OnZFS(root); err == nil && !on {
+		return
+	}
+	t.Logf("%s is on ZFS, so the run is told it isn't", root)
+	onZFSByKernel(t, false)
+}
+
 func TestReportNotOnZFS(t *testing.T) {
 	stateDir := isolateState(t)
 	root := tempDir(t)
+	treatAsNotZFS(t, root)
 	code, out, errOut := runCLI(t, "--report", root)
 	if code != exitUsage || out != "" {
 		t.Errorf("exit %d, stdout %q; want exit 2 and no table", code, out)
@@ -639,6 +688,7 @@ const dedupCmd = "zfs get -r -H -t filesystem -o name,property,value dedup,mount
 func TestVdevReportWhenNotOnZFS(t *testing.T) {
 	isolateState(t)
 	root := makeTree(t, "a")
+	treatAsNotZFS(t, root)
 	code, out, errOut := runCLI(t, "--vdev-report", root)
 	if code != exitOK || out != "" {
 		t.Fatalf("exit %d, stdout %q; want 0 and no table", code, out)

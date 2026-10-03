@@ -32,6 +32,10 @@ const (
 	opListed   = "listed"   // one path in a list introduced by the line before
 )
 
+// maxOtherNames is how many other names of a hardlinked file its line shows. With --debug, the rest
+// are listed below it.
+const maxOtherNames = 3
+
 // newLogger returns the logger for a run: human-friendly lines on w, in colour if w is a terminal.
 func newLogger(w io.Writer, debug, filenameOnly bool) *logrus.Logger {
 	log := logrus.New()
@@ -60,6 +64,7 @@ func wantColor(w io.Writer) bool {
 // logFormatter writes one line per log entry, such as
 //
 //	3:04:05 PM  ✓ rebalanced  photos/IMG 1.jpg  12.3 MiB at 110.5 MB/s
+//	3:04:05 PM  ✓ rebalanced  links/a (also named links/b, c)  5.0 MiB at 98.1 MB/s
 //	3:04:05 PM  ! skipped  photos/b.jpg  the file changed while it was being copied — nothing was changed
 //
 // It builds the line from the entry's structured fields ("op", "path", "names", "size", "mbps",
@@ -82,8 +87,19 @@ func (f *logFormatter) Format(e *logrus.Entry) ([]byte, error) {
 	// A hardlinked file is named by its first name, and "names" holds all of them.
 	names, _ := e.Data["names"].([]string)
 	item := f.renderPath(file)
-	if n := len(names) - 1; n > 0 {
-		item += fmt.Sprintf(" (+%d hardlinked %s)", n, choose(n, "name", "names"))
+	var hidden []string // other names that don't fit on the line
+	if len(names) > 1 {
+		others := names[1:]
+		shown := others[:min(len(others), maxOtherNames)]
+		hidden = others[len(shown):]
+		parts := make([]string, len(shown), len(shown)+1)
+		for i, name := range shown {
+			parts[i] = f.renderPath(name)
+		}
+		if len(hidden) > 0 {
+			parts = append(parts, fmt.Sprintf("+%s more", thousands(len(hidden))))
+		}
+		item += " (also named " + strings.Join(parts, ", ") + ")"
 	}
 	switch op {
 	case "rebalanced":
@@ -126,9 +142,9 @@ func (f *logFormatter) Format(e *logrus.Entry) ([]byte, error) {
 		}
 	}
 	b.WriteByte('\n')
-	// With --debug, every other name of a hardlinked file is listed below it.
-	if len(names) > 1 && e.Logger != nil && e.Logger.IsLevelEnabled(logrus.DebugLevel) {
-		for _, name := range names[1:] {
+	// With --debug, the names of a hardlinked file that didn't fit on its line are listed below it.
+	if len(hidden) > 0 && e.Logger != nil && e.Logger.IsLevelEnabled(logrus.DebugLevel) {
+		for _, name := range hidden {
 			b.WriteString(f.paint(ansiDim, e.Time.Format("3:04:05 PM")) + "      also " + f.renderPath(name) + "\n")
 		}
 	}

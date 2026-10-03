@@ -271,16 +271,12 @@ func (c *Client) WaitForFrees(ctx context.Context, pool string, timeout time.Dur
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
-		out, err := c.run(waitCtx, "zpool", "get", "-Hp", "-o", "value", "freeing", pool)
+		freeing, err := c.Freeing(waitCtx, pool)
 		if err != nil {
 			if timedOut, ctxErr := stopped(); timedOut || ctxErr != nil {
 				return timedOut, ctxErr
 			}
 			return false, err
-		}
-		freeing, err := parseOptionalUint(strings.TrimSpace(string(out)))
-		if err != nil {
-			return false, fmt.Errorf("zpool get freeing: %w", err)
 		}
 		if freeing == 0 {
 			return false, nil
@@ -291,6 +287,22 @@ func (c *Client) WaitForFrees(ctx context.Context, pool string, timeout time.Dur
 		case <-ticker.C:
 		}
 	}
+}
+
+// Freeing returns how many bytes pool is still releasing in the background
+// from destroyed datasets and snapshots (its "freeing" property). It is a
+// quick question, so it also shows whether the zpool command can be run at
+// all before a longer wait such as WaitForFrees.
+func (c *Client) Freeing(ctx context.Context, pool string) (uint64, error) {
+	out, err := c.run(ctx, "zpool", "get", "-Hp", "-o", "value", "freeing", pool)
+	if err != nil {
+		return 0, err
+	}
+	n, err := parseOptionalUint(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0, fmt.Errorf("zpool get freeing: %w", err)
+	}
+	return n, nil
 }
 
 // SnapshotBytes returns the space held only by snapshots of dataset and all

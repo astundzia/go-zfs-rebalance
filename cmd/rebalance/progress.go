@@ -75,9 +75,13 @@ func logSummary(log *logrus.Logger, s rebalance.Summary, o options) {
 	took := formatDuration(s.Duration)
 	switch s.Stopped {
 	case rebalance.None:
-		if s.Total == 0 {
+		nothingNew := s.NothingNew()
+		switch {
+		case s.Total == 0:
 			log.Info("Finished: there was nothing to rebalance.")
-		} else {
+		case nothingNew != "":
+			log.Info(nothingNew)
+		default:
 			log.Infof("Finished in %s: %s.", took, rebalancedText(s))
 		}
 	case rebalance.Interrupted:
@@ -113,17 +117,34 @@ func logSummary(log *logrus.Logger, s rebalance.Summary, o options) {
 	if n := s.Skipped[rebalance.SkipHardlinked]; n > 0 {
 		log.Infof("To include the %s with hardlinks, add --process-hardlinks.", countFiles(n))
 	}
-	// Without root, files of other users, or in folders the user can't change, are skipped before
-	// anything is read. A run with sudo keeps its progress in root's own state folder, so it can't
-	// carry on from this run's progress.
-	owned, refused := s.Skipped[rebalance.SkipOwner], s.Skipped[rebalance.SkipNoPermission]
-	if n := owned + refused; n > 0 && !isRoot() {
-		which := "owned by other users"
-		if refused > 0 {
-			which = "you don't have permission to change"
-		}
-		log.Infof("To include the %s %s, run it again with sudo (that run starts from the beginning).", countFiles(n), which)
+	if n := s.Skipped[rebalance.SkipBusy]; n > 0 {
+		log.Infof("To include the %s that %s in use, %s once %s free.", countFiles(n), choose(n, "was", "were"), again, choose(n, "it's", "they're"))
 	}
+	if hint := sudoHint(s.Skipped); hint != "" {
+		log.Info(hint)
+	}
+}
+
+// sudoHint suggests running with sudo to include the files skipped because only root may replace
+// them, or returns "" when there are none or the run already has root. Other reasons for a skip,
+// such as an immutable file, aren't helped by sudo. A run with sudo keeps its progress in root's
+// own state folder, so it can't carry on from this run's progress.
+func sudoHint(skipped map[rebalance.SkipReason]int) string {
+	owner, group := skipped[rebalance.SkipOwner], skipped[rebalance.SkipGroup]
+	// Without root, a copy that couldn't be given the file's owner or group is also down to a
+	// permission only root has.
+	n := owner + group + skipped[rebalance.SkipNoPermission] + skipped[rebalance.SkipOwnerNotKept]
+	if n == 0 || isRoot() {
+		return ""
+	}
+	which := "you don't have permission to change"
+	switch n {
+	case owner:
+		which = "owned by other users"
+	case group:
+		which = choose(n, "in a group you're not in", "in groups you're not in")
+	}
+	return fmt.Sprintf("To include the %s %s, run it again with sudo (that run starts from the beginning).", countFiles(n), which)
 }
 
 // rebalancedText is "rebalanced 3 files (12.3 MiB at 110.5 MB/s)", or "rebalanced 3 of 5 files ..."

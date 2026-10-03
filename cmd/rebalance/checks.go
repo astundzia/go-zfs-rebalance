@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/astundzia/go-zfs-rebalance/v2/internal/rebalance"
@@ -46,7 +47,9 @@ type zfsView struct {
 	dataset string             // "" when the folder isn't on ZFS, or that couldn't be found out
 	noPool  string             // why dataset is "", for the vdev report's warning
 	deduped []zfs.DatasetDedup // datasets in the folder with deduplication on
-	blocked bool               // starting the zfs tools was refused, and the user was told why
+	// blocked is set once starting the zfs tools has been refused and the user told why. The
+	// block-cloning watch may set it while the files are being rewritten.
+	blocked atomic.Bool
 }
 
 // ask runs one zfs query, giving up after zfsTimeout.
@@ -126,11 +129,10 @@ func (z *zfsView) lookup(ctx context.Context, root string) {
 // execBlocked explains, once per run, that the system refused to start the zfs tools, and what
 // that means for the run (what, such as "so there's no vdev table").
 func (z *zfsView) execBlocked(what string) {
-	if z.blocked {
+	if !z.blocked.CompareAndSwap(false, true) {
 		z.log.Debugf("Couldn't start the zfs tools again, %s", what)
 		return
 	}
-	z.blocked = true
 	z.log.Warnf("Couldn't start the zfs tools, %s. %s", what, trueNASHint)
 }
 
@@ -261,7 +263,7 @@ func (z *zfsView) reportBefore(ctx context.Context, stdout io.Writer) *vdevBefor
 		return nil
 	}
 	b := &vdevBefore{dist: d}
-	b.bclone, b.bcloneOK = z.bcloneUsed(ctx, pool)
+	b.bclone, b.bcloneOK = z.bcloneUsed(ctx, pool, "so block cloning won't be checked")
 	b.bclonePeak = b.bclone
 	fmt.Fprintln(stdout, "Before:")
 	if err := zfs.RenderReport(stdout, d); err != nil {
@@ -274,7 +276,8 @@ func (z *zfsView) reportBefore(ctx context.Context, stdout io.Writer) *vdevBefor
 // watchCloning reads the pool's block-cloning counter every cloneWatch until the returned function
 // is called, keeping the highest value in b. A file that was cloned instead of rewritten raises the
 // counter only until it replaces the original, which frees the original's share again, so the
-// counters at the start and end can be the same even when every file was cloned.
+// counters at the start and end can be the same even when every file was cloned. If the zfs tools
+// can't be started any more, the user is told (once) and the watch ends.
 func (z *zfsView) watchCloning(b *vdevBefore) (stop func()) {
 	if b == nil || !b.bcloneOK {
 		return func() {}
@@ -290,8 +293,12 @@ func (z *zfsView) watchCloning(b *vdevBefore) (stop func()) {
 				return
 			case <-ticker.C:
 			}
-			if n, ok := z.bcloneUsed(ctx, b.dist.Pool); ok {
+			n, ok := z.bcloneUsed(ctx, b.dist.Pool, "so block cloning is no longer being checked")
+			switch {
+			case ok:
 				b.bclonePeak = max(b.bclonePeak, n)
+			case z.blocked.Load():
+				return
 			}
 		}
 	})
@@ -306,21 +313,36 @@ func (z *zfsView) watchCloning(b *vdevBefore) (stop func()) {
 // Ctrl+C during the run the wait can still be skipped with another).
 func (z *zfsView) reportAfter(gentle, hard context.Context, stdout io.Writer, before *vdevBefore) {
 	const noTable = "so there's no before-and-after table"
+	if z.blocked.Load() {
+		// The user was told during the run why the zfs tools can't be started.
+		z.log.Warn("Skipping the before-and-after table, because the zfs tools couldn't be started.")
+		return
+	}
 	pool := before.dist.Pool
 	var notes []string
 	waited := false
 	if ctx := firstLive(gentle, hard); ctx != nil {
-		z.stop.setPhase(phaseWaiting)
-		z.log.Info("Waiting for ZFS to finish freeing the old copies' space, so the table is accurate (up to 2 minutes; press Ctrl+C to skip)…")
-		timedOut, err := z.client.WaitForFrees(ctx, pool, freeWait)
-		z.stop.setPhase(phaseFinishing)
+		// Ask ZFS something quick first, so the run only says it is waiting when it can.
+		_, err := ask(ctx, z.client.Freeing, pool)
+		if err == nil {
+			z.stop.setPhase(phaseWaiting)
+			z.log.Info("Waiting for ZFS to finish freeing the old copies' space, so the table is accurate (up to 2 minutes; press Ctrl+C to skip)…")
+			var timedOut bool
+			timedOut, err = z.client.WaitForFrees(ctx, pool, freeWait)
+			z.stop.setPhase(phaseFinishing)
+			switch {
+			case timedOut:
+				notes = append(notes, "ZFS was still freeing space after 2 minutes, so the old vdevs may look fuller than they really are")
+				waited = true
+			case err == nil:
+				waited = true
+			}
+		}
 		switch {
-		case timedOut:
-			notes = append(notes, "ZFS was still freeing space after 2 minutes, so the old vdevs may look fuller than they really are")
-			waited = true
-		case err == nil:
-			waited = true
-		case ctx.Err() == nil:
+		case errors.Is(err, zfs.ErrExecBlocked):
+			z.execBlocked(noTable)
+			return
+		case err != nil && ctx.Err() == nil:
 			z.debug("Couldn't wait for ZFS to free space", err)
 		}
 	}
@@ -345,7 +367,7 @@ func (z *zfsView) reportAfter(gentle, hard context.Context, stdout io.Writer, be
 	} else if held > 0 {
 		notes = append(notes, fmt.Sprintf("snapshots hold %s of old data, so the old vdevs won't shrink until those snapshots are removed", zfs.FormatBytes(held)))
 	}
-	if now, ok := z.bcloneUsed(ctx, pool); ok && before.bcloneOK {
+	if now, ok := z.bcloneUsed(ctx, pool, "so block cloning wasn't checked at the end"); ok && before.bcloneOK {
 		if peak := max(before.bclonePeak, now); peak > before.bclone {
 			notes = append(notes, fmt.Sprintf("block cloning grew by %s during the run; if nothing else was copying files, some files may have been cloned instead of rewritten", zfs.FormatBytes(peak-before.bclone)))
 		}
@@ -372,15 +394,24 @@ func firstLive(ctxs ...context.Context) context.Context {
 	return nil
 }
 
-func (z *zfsView) bcloneUsed(ctx context.Context, pool string) (uint64, bool) {
-	ctx, cancel := context.WithTimeout(ctx, zfsTimeout)
+// bcloneUsed reads the pool's block-cloning counter. ok is false when the pool has none or it
+// couldn't be read. A refused start of the zfs tools is explained like any other check's, saying
+// what follows from it (ifBlocked, such as "so block cloning won't be checked").
+func (z *zfsView) bcloneUsed(ctx context.Context, pool, ifBlocked string) (n uint64, ok bool) {
+	qctx, cancel := context.WithTimeout(ctx, zfsTimeout)
 	defer cancel()
-	n, ok, err := z.client.BcloneUsed(ctx, pool)
-	if err != nil {
+	n, ok, err := z.client.BcloneUsed(qctx, pool)
+	switch {
+	case err == nil:
+		return n, ok
+	case ctx.Err() != nil:
+		// No longer wanted, as when the run ends while the watch is asking.
+	case errors.Is(err, zfs.ErrExecBlocked):
+		z.execBlocked(ifBlocked)
+	default:
 		z.debug("Couldn't check block cloning", err)
-		return 0, false
 	}
-	return n, ok
+	return 0, false
 }
 
 func (z *zfsView) debug(msg string, err error) {

@@ -40,18 +40,32 @@ var (
 	// function is called. SIGHUP is left alone when it is already ignored, as under nohup, so the
 	// run carries on after a closed SSH session. Catching SIGPIPE means a closed pipe on stdout or
 	// stderr makes writes fail instead of killing the process, so the run can stop gently.
+	//
+	// SIGPIPE stays caught after that, for the rest of the process (see keepCatchingSIGPIPE).
 	notifySignals = func(c chan<- os.Signal) (stop func()) {
 		sigs := []os.Signal{os.Interrupt, syscall.SIGTERM, syscall.SIGPIPE}
 		if !signal.Ignored(syscall.SIGHUP) {
 			sigs = append(sigs, syscall.SIGHUP)
 		}
 		signal.Notify(c, sigs...)
+		keepCatchingSIGPIPE()
 		return func() { signal.Stop(c) }
 	}
 	clock       = time.Now
 	exitNow     = os.Exit
 	afterSignal = func() {}
 )
+
+// keepCatchingSIGPIPE makes sure SIGPIPE is caught until the process ends, so a write to a closed
+// stdout or stderr fails instead of killing the process (exit code 141). Without it, a message
+// about the stop written just after the run stops watching signals, such as one still on its way
+// to a pipe whose reader has quit, would get the process killed instead of ending with 130.
+// SIGPIPE is never ignored instead: changing it to ignored opens a moment in which a late SIGPIPE
+// from an earlier failed write, which macOS can deliver some time afterwards, kills the process.
+// The signals sent to the channel are never read; the signal package drops them once it is full.
+var keepCatchingSIGPIPE = sync.OnceFunc(func() {
+	signal.Notify(make(chan os.Signal, 1), syscall.SIGPIPE)
+})
 
 // stopper turns signals into stop requests:
 //

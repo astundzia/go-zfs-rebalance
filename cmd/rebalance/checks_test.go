@@ -125,32 +125,119 @@ func TestZFSToolsCantReachZFS(t *testing.T) {
 }
 
 // TestZFSToolsRefusedAfterTheRun is TrueNAS once the sudo session that started the run has ended:
-// starting zpool fails with ENOSYS. The run explains it in plain words and skips the table.
+// starting zpool fails with ENOSYS. The run explains it once, in plain words, and skips the table.
+// It doesn't say it is waiting for ZFS when it can't even ask.
 func TestZFSToolsRefusedAfterTheRun(t *testing.T) {
+	for _, tt := range []struct {
+		firstRefused string
+		waiting      bool // the wait for ZFS was announced before the refusal
+	}{
+		{"zpool get -Hp -o value freeing tank", false},
+		{"zpool sync tank", true},
+	} {
+		t.Run(tt.firstRefused, func(t *testing.T) {
+			isolateState(t)
+			root := makeTree(t, "a", "b")
+			var refused atomic.Bool
+			f := &fakeZFS{answers: poolAnswers(root), respond: func(cmdline string) (string, bool, error) {
+				if cmdline == tt.firstRefused {
+					refused.Store(true)
+				}
+				if refused.Load() {
+					return "", true, refusedStart(cmdline)
+				}
+				return "", false, nil
+			}}
+			useZFS(t, f)
+			code, out, errOut := runCLI(t, "--vdev-report", "--db", filepath.Join(t.TempDir(), "p.db"), root)
+			if code != exitOK {
+				t.Fatalf("exit %d, want 0", code)
+			}
+			mustContain(t, out, "Before:\n")
+			mustNotContain(t, out, "Before and after:")
+			mustContain(t, errOut, "rebalanced 2 files",
+				"! Couldn't start the zfs tools, so there's no before-and-after table. TrueNAS blocks starting other programs once the sudo session that started this run has ended. Next time, start tmux first without sudo, then run sudo rebalance inside it.")
+			mustNotContain(t, errOut, "function not implemented", "fork/exec", "/sbin/zpool")
+			if strings.Count(errOut, "TrueNAS") != 1 {
+				t.Error("the explanation should be given once")
+			}
+			if got := strings.Contains(errOut, "Waiting for ZFS"); got != tt.waiting {
+				t.Errorf("said it was waiting for ZFS: %v, want %v", got, tt.waiting)
+			}
+		})
+	}
+}
+
+// TestZFSToolsGoneAfterTheRun checks that when the zfs tools can't be found any more after the run,
+// the run doesn't say it is waiting for ZFS, and says why there is no table.
+func TestZFSToolsGoneAfterTheRun(t *testing.T) {
 	isolateState(t)
-	root := makeTree(t, "a", "b")
-	var refused atomic.Bool
-	f := &fakeZFS{answers: poolAnswers(root), respond: func(cmdline string) (string, bool, error) {
-		if cmdline == "zpool sync tank" {
-			refused.Store(true)
+	root := makeTree(t, "a")
+	var gone atomic.Bool
+	useZFS(t, &fakeZFS{answers: poolAnswers(root), respond: func(cmdline string) (string, bool, error) {
+		if cmdline == "zpool get -Hp -o value freeing tank" {
+			gone.Store(true)
 		}
-		if refused.Load() {
-			return "", true, refusedStart(cmdline)
+		if gone.Load() {
+			return "", true, &exec.Error{Name: "zpool", Err: exec.ErrNotFound}
 		}
 		return "", false, nil
-	}}
-	useZFS(t, f)
+	}})
 	code, out, errOut := runCLI(t, "--vdev-report", "--db", filepath.Join(t.TempDir(), "p.db"), root)
+	if code != exitOK {
+		t.Fatalf("exit %d, want 0", code)
+	}
+	mustNotContain(t, out, "Before and after:")
+	mustContain(t, errOut, "rebalanced 1 file",
+		"! Couldn't read how full each vdev is after the run, so there's no before-and-after table  the zfs and zpool commands weren't found")
+	mustNotContain(t, errOut, "Waiting for ZFS", "executable file not found")
+}
+
+// TestZFSToolsRefusedDuringTheRun is TrueNAS when the sudo session ends while files are still being
+// rewritten. The block-cloning watch finds out first: it explains why (once), stops asking, and the
+// end of the run skips the wait and the table without trying the zfs tools again.
+func TestZFSToolsRefusedDuringTheRun(t *testing.T) {
+	isolateState(t)
+	old := cloneWatch
+	cloneWatch = time.Millisecond
+	t.Cleanup(func() { cloneWatch = old })
+	root := makeTree(t, "a", "b", "c")
+	var refusing atomic.Bool
+	var refused atomic.Int32
+	useZFS(t, &fakeZFS{answers: poolAnswers(root), respond: func(cmdline string) (string, bool, error) {
+		if !refusing.Load() {
+			return "", false, nil
+		}
+		refused.Add(1)
+		return "", true, refusedStart(cmdline)
+	}})
+	var once sync.Once
+	stderr := &syncBuffer{hook: func(line string) {
+		if strings.Contains(line, "✓ rebalanced") {
+			// Hold the run here until the watch has been refused.
+			once.Do(func() {
+				refusing.Store(true)
+				for deadline := time.Now().Add(5 * time.Second); refused.Load() == 0 && time.Now().Before(deadline); {
+					time.Sleep(time.Millisecond)
+				}
+			})
+		}
+	}}
+	code, out, errOut := runWith(t, stderr, "--vdev-report", "--concurrency", "1", "--db", filepath.Join(t.TempDir(), "p.db"), root)
 	if code != exitOK {
 		t.Fatalf("exit %d, want 0", code)
 	}
 	mustContain(t, out, "Before:\n")
 	mustNotContain(t, out, "Before and after:")
-	mustContain(t, errOut, "rebalanced 2 files",
-		"! Couldn't start the zfs tools, so there's no before-and-after table. TrueNAS blocks starting other programs once the sudo session that started this run has ended. Next time, start tmux first without sudo, then run sudo rebalance inside it.")
-	mustNotContain(t, errOut, "function not implemented", "fork/exec", "/sbin/zpool")
+	mustContain(t, errOut, "rebalanced 3 files",
+		"! Couldn't start the zfs tools, so block cloning is no longer being checked. TrueNAS blocks starting other programs",
+		"! Skipping the before-and-after table, because the zfs tools couldn't be started.")
+	mustNotContain(t, errOut, "Waiting for ZFS", "function not implemented")
 	if strings.Count(errOut, "TrueNAS") != 1 {
 		t.Error("the explanation should be given once")
+	}
+	if n := refused.Load(); n != 1 {
+		t.Errorf("the zfs tools were tried %d times after being refused, want just the once", n)
 	}
 }
 

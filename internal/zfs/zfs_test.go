@@ -231,6 +231,33 @@ func TestWaitForFrees(t *testing.T) {
 	})
 }
 
+func TestFreeing(t *testing.T) {
+	ctx := context.Background()
+	for _, tt := range []struct {
+		out  string
+		want uint64
+	}{
+		{"4096000\n", 4096000},
+		{"0\n", 0},
+		{"-\n", 0},
+	} {
+		r := answer(t, map[string]string{"zpool get -Hp -o value freeing tank": tt.out})
+		n, err := (&Client{Runner: r}).Freeing(ctx, "tank")
+		require.NoError(t, err)
+		require.Equal(t, tt.want, n, "output %q", tt.out)
+	}
+
+	r := answer(t, map[string]string{"zpool get -Hp -o value freeing tank": "lots\n"})
+	_, err := (&Client{Runner: r}).Freeing(ctx, "tank")
+	require.ErrorContains(t, err, "zpool get freeing")
+
+	_, err = (&Client{Runner: failWith(&CommandError{Command: "zpool",
+		Err: &fs.PathError{Op: "fork/exec", Path: "/sbin/zpool", Err: syscall.ENOSYS}})}).Freeing(ctx, "tank")
+	require.ErrorIs(t, err, ErrExecBlocked)
+	_, err = (&Client{Runner: failWith(&exec.Error{Name: "zpool", Err: exec.ErrNotFound})}).Freeing(ctx, "tank")
+	require.ErrorIs(t, err, ErrToolsMissing)
+}
+
 func TestSnapshotBytes(t *testing.T) {
 	// zfs get -r also lists the snapshots themselves, which report "-".
 	r := answer(t, map[string]string{
@@ -383,7 +410,8 @@ func TestExecRunner(t *testing.T) {
 	})
 
 	t.Run("found in sbin when not on PATH", func(t *testing.T) {
-		sbin, sh := t.TempDir(), mustLookPath(t, "sh")
+		sbin, sh := testDir(t), mustLookPath(t, "sh")
+		skipUnlessRunnable(t, sbin, sh)
 		writeScript(t, filepath.Join(sbin, "fakezpool"), "#!"+sh+"\necho \"pool $1\"\n", 0o755)
 		writeScript(t, filepath.Join(sbin, "notrunnable"), "#!"+sh+"\necho hi\n", 0o644)
 		old := sbinDirs
@@ -407,6 +435,36 @@ func TestExecRunner(t *testing.T) {
 		require.Error(t, err)
 		require.Less(t, time.Since(start), 5*time.Second)
 	})
+}
+
+// testDirEnv names a folder to make test files in instead of the system's temporary folder, as the
+// other packages' tests do. TrueNAS, for one, mounts /tmp so that programs can't be run from it.
+const testDirEnv = "REBALANCE_TEST_DIR"
+
+// testDir returns a new empty folder in the one named by testDirEnv, or else in the system's
+// temporary folder, removed when the test ends.
+func testDir(t *testing.T) string {
+	t.Helper()
+	base := os.Getenv(testDirEnv)
+	if base == "" {
+		return t.TempDir()
+	}
+	dir, err := os.MkdirTemp(base, "zfs-test-")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
+// skipUnlessRunnable skips the test unless a script in dir can be run with the shell sh. A folder
+// on a filesystem mounted noexec can't, and on TrueNAS sudo kills a program started from one.
+func skipUnlessRunnable(t *testing.T, dir, sh string) {
+	t.Helper()
+	probe := filepath.Join(dir, "probe")
+	writeScript(t, probe, "#!"+sh+"\nexit 0\n", 0o755)
+	if err := exec.Command(probe).Run(); err != nil {
+		t.Skipf("can't run programs in %s (%v); set %s to a folder that can", dir, err, testDirEnv)
+	}
+	require.NoError(t, os.Remove(probe))
 }
 
 func mustLookPath(t *testing.T, name string) string {
@@ -433,6 +491,8 @@ func TestStartRefused(t *testing.T) {
 	require.ErrorIs(t, err, ErrExecBlocked)
 	_, err = c.WaitForFrees(ctx, "tank", time.Minute)
 	require.ErrorIs(t, err, ErrExecBlocked)
+	_, err = c.Freeing(ctx, "tank")
+	require.ErrorIs(t, err, ErrExecBlocked)
 	_, _, err = c.BcloneUsed(ctx, "tank")
 	require.ErrorIs(t, err, ErrExecBlocked)
 }
@@ -441,10 +501,10 @@ func TestOnZFS(t *testing.T) {
 	on, err := OnZFS(t.TempDir())
 	require.NoError(t, err)
 	t.Logf("the temporary folder is on ZFS: %v", on)
-	if dir := os.Getenv("REBALANCE_TEST_DIR"); dir != "" {
+	if dir := os.Getenv(testDirEnv); dir != "" {
 		on, err := OnZFS(dir)
 		require.NoError(t, err)
-		t.Logf("REBALANCE_TEST_DIR %s is on ZFS: %v", dir, on)
+		t.Logf("%s %s is on ZFS: %v", testDirEnv, dir, on)
 	}
 
 	_, err = OnZFS(filepath.Join(t.TempDir(), "missing"))

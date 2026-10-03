@@ -109,8 +109,16 @@ func TestParseArgsErrors(t *testing.T) {
 		{"no folder", []string{"--debug"}, "please give the folder to rebalance"},
 		{"passes 0", []string{"--passes", "0", "/a"}, "--passes must be 1 or more (it was 0). A normal run already rewrites every file once"},
 		{"negative passes", []string{"/a", "--passes=-2"}, "--passes must be 1 or more"},
-		{"passes not a number", []string{"--passes", "two", "/a"}, `invalid value "two" for flag -passes: it must be a whole number`},
-		{"unknown checksum", []string{"--checksum", "foo", "/a"}, `--checksum: "foo" isn't a checksum this tool knows`},
+		{"passes not a number", []string{"--passes", "two", "/a"}, `--passes needs a whole number, like 2, not "two"`},
+		{"concurrency not a number", []string{"/a", "--concurrency=abc"}, `--concurrency needs a whole number, like 4, not "abc"`},
+		{"concurrency too big", []string{"/a", "--concurrency=99999999999999999999"}, `--concurrency needs a smaller whole number, like 4, not "99999999999999999999"`},
+		{"concurrency typed with one dash", []string{"-concurrency", "1.5", "/a"}, `-concurrency needs a whole number, like 4, not "1.5"`},
+		{"size threshold empty", []string{"--size-threshold=", "/a"}, "--size-threshold needs a whole number, like 100"},
+		{"value with control characters", []string{"--passes", "\x1b[2J", "/a"}, `--passes needs a whole number, like 2, not "\x1b[2J"`},
+		{"on/off option given a value", []string{"--resume=maybe", "/a"}, `--resume is an on/off option: give it on its own, without "=maybe"`},
+		{"old option given a value", []string{"/a", "-no-cleanup-balance=sometimes"},
+			`-no-cleanup-balance is an on/off option: give it on its own, without "=sometimes"`},
+		{"unknown checksum", []string{"--checksum", "foo", "/a"}, `--checksum needs sha256 (the default) or md5, not "foo"`},
 		{"negative size threshold", []string{"--size-threshold", "-1", "/a"}, "--size-threshold can't be negative"},
 		{"negative concurrency", []string{"--concurrency", "-1", "/a"}, "--concurrency can't be negative"},
 		{"unknown option", []string{"--frobnicate", "/a"}, "there's no option called --frobnicate"},
@@ -122,13 +130,17 @@ func TestParseArgsErrors(t *testing.T) {
 			"there's no option called -tank/media. If that's the folder to rebalance, put -- before it, like this: rebalance -- -tank/media"},
 		{"missing value", []string{"/a", "--db"}, "--db needs a value after it"},
 		{"missing value, one dash", []string{"/a", "-db"}, "-db needs a value after it"},
-		{"bad syntax", []string{"---x", "/a"}, "bad flag syntax"},
+		{"bad syntax", []string{"---x", "/a"}, "there's no option called ---x"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := parseArgs(tt.args)
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Errorf("parseArgs(%q) = %v, want an error containing %q", tt.args, err, tt.want)
+			}
+			// The flag package's own wording never shows.
+			if err != nil && strings.Contains(err.Error(), "flag") {
+				t.Errorf("parseArgs(%q) = %v, which talks about flags", tt.args, err)
 			}
 		})
 	}

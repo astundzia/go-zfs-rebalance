@@ -133,6 +133,64 @@ func TestLogSummary(t *testing.T) {
 			options{},
 			[]string{"Skipped 4 files: 2 leftover .balance files, 1 file with hardlinks outside the folder, 1 file marked immutable or append-only."},
 			nil},
+		{"each reason has its own words",
+			rebalance.Summary{Total: 20, Rebalanced: 5, Skipped: map[rebalance.SkipReason]int{
+				rebalance.SkipImmutable: 6, rebalance.SkipUndeletable: 5, rebalance.SkipProjectID: 4,
+				rebalance.SkipMetadata: 3, rebalance.SkipOwnerNotKept: 2, rebalance.SkipBusy: 1}},
+			options{},
+			[]string{"Skipped 21 files: 6 files marked immutable or append-only, 5 files protected from deletion, " +
+				"4 files whose project IDs differ from their folders', 3 files whose permissions can't be kept exactly, " +
+				"2 files whose owners or groups couldn't be kept, 1 file in use by another program or run."},
+			nil},
+		{"a file in use",
+			rebalance.Summary{Total: 3, Rebalanced: 2, Skipped: map[rebalance.SkipReason]int{rebalance.SkipBusy: 1}},
+			options{},
+			[]string{"Finished in under a second: rebalanced 2 of 3 files.", "Skipped 1 file: 1 file in use by another program or run.",
+				"To include the 1 file that was in use, run the same command again with --resume added once it's free."},
+			[]string{"sudo"}},
+		{"files in use while resuming",
+			rebalance.Summary{Total: 3, Rebalanced: 1, Skipped: map[rebalance.SkipReason]int{rebalance.SkipBusy: 2}},
+			options{resume: true},
+			[]string{"To include the 2 files that were in use, run the same command again once they're free."},
+			[]string{"--resume"}},
+		{"files in groups you're not in",
+			rebalance.Summary{Total: 1, Rebalanced: 1, Skipped: map[rebalance.SkipReason]int{rebalance.SkipGroup: 2}},
+			options{},
+			[]string{"Skipped 2 files: 2 files in groups you're not in.",
+				"To include the 2 files in groups you're not in, run it again with sudo (that run starts from the beginning)."},
+			[]string{"owned by"}},
+		{"a file in a group you're not in",
+			rebalance.Summary{Total: 1, Rebalanced: 1, Skipped: map[rebalance.SkipReason]int{rebalance.SkipGroup: 1}},
+			options{},
+			[]string{"Skipped 1 file: 1 file in a group you're not in.",
+				"To include the 1 file in a group you're not in, run it again with sudo"},
+			nil},
+		{"others' files and groups",
+			rebalance.Summary{Total: 1, Rebalanced: 1, Skipped: map[rebalance.SkipReason]int{rebalance.SkipOwner: 3, rebalance.SkipGroup: 1}},
+			options{},
+			[]string{"Skipped 4 files: 3 files owned by someone else, 1 file in a group you're not in.",
+				"To include the 4 files you don't have permission to change, run it again with sudo"},
+			nil},
+		{"owner not kept without root",
+			rebalance.Summary{Total: 2, Rebalanced: 1, Skipped: map[rebalance.SkipReason]int{rebalance.SkipOwnerNotKept: 1}},
+			options{},
+			[]string{"1 file whose owner or group couldn't be kept.",
+				"To include the 1 file you don't have permission to change, run it again with sudo"},
+			nil},
+		{"no sudo hint for reasons sudo doesn't fix",
+			rebalance.Summary{Total: 3, Rebalanced: 1, Skipped: map[rebalance.SkipReason]int{
+				rebalance.SkipImmutable: 1, rebalance.SkipProjectID: 1, rebalance.SkipMetadata: 1, rebalance.SkipChanged: 1}},
+			options{},
+			[]string{"Skipped 4 files:"},
+			[]string{"sudo", "To include"}},
+		{"nothing new",
+			rebalance.Summary{Total: 4, Remaining: 0,
+				Skipped:    map[rebalance.SkipReason]int{rebalance.SkipAlreadyDone: 20, rebalance.SkipImmutable: 3, rebalance.SkipProjectID: 1},
+				RunSkipped: map[rebalance.SkipReason]int{rebalance.SkipImmutable: 3, rebalance.SkipProjectID: 1}},
+			options{resume: true},
+			[]string{"  Nothing new to rebalance: the 4 remaining files were skipped again (3 files marked immutable or append-only, 1 file whose project ID differs from its folder's).",
+				"Skipped 24 files: 20 already done, 3 files marked immutable or append-only, 1 file whose project ID differs from its folder's."},
+			[]string{"Finished", "!", "run the same command"}},
 		{"folder times not put back",
 			rebalance.Summary{Total: 2, Rebalanced: 2, FolderTimesNotRestored: 1},
 			options{},
@@ -167,8 +225,10 @@ func runAsRoot(t *testing.T, root bool) {
 func TestNoSudoHintAsRoot(t *testing.T) {
 	runAsRoot(t, true)
 	log, buf := testLogger(logrus.InfoLevel)
-	logSummary(log, rebalance.Summary{Total: 1, Rebalanced: 1, Skipped: map[rebalance.SkipReason]int{rebalance.SkipOwner: 1}}, options{})
-	mustContain(t, buf.String(), "Skipped 1 file: 1 file owned by someone else.")
+	logSummary(log, rebalance.Summary{Total: 1, Rebalanced: 1, Skipped: map[rebalance.SkipReason]int{
+		rebalance.SkipOwner: 1, rebalance.SkipGroup: 1, rebalance.SkipOwnerNotKept: 1, rebalance.SkipNoPermission: 1}}, options{})
+	mustContain(t, buf.String(), "Skipped 4 files: 1 file in a group you're not in, 1 file you aren't allowed to replace, "+
+		"1 file owned by someone else, 1 file whose owner or group couldn't be kept.")
 	mustNotContain(t, buf.String(), "sudo")
 }
 

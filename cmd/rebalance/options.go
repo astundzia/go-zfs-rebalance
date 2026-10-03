@@ -84,16 +84,16 @@ func newFlagSet(o *options) *flag.FlagSet {
 	fs := flag.NewFlagSet("rebalance", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	fs.Usage = func() {}
-	fs.Func("passes", "", wholeNumber(&o.passes))
+	fs.Func("passes", "", wholeNumber(&o.passes, 2))
 	fs.BoolVar(&o.resume, "resume", false, "")
 	fs.StringVar(&o.db, "db", "", "")
 	fs.BoolVar(&o.processHardlinks, "process-hardlinks", false, "")
-	fs.Func("concurrency", "", wholeNumber(&o.concurrency))
+	fs.Func("concurrency", "", wholeNumber(&o.concurrency, 4))
 	fs.BoolVar(&o.noCleanup, "no-cleanup", false, "")
 	fs.BoolFunc("no-cleanup-balance", "", func(s string) error {
 		on, err := strconv.ParseBool(s)
 		if err != nil {
-			return errors.New("it must be true or false")
+			return err
 		}
 		o.noCleanup = o.noCleanup || on
 		o.oldNoCleanup = true
@@ -101,7 +101,7 @@ func newFlagSet(o *options) *flag.FlagSet {
 	})
 	fs.BoolVar(&o.noRandom, "no-random", false, "")
 	fs.StringVar(&o.checksum, "checksum", string(fileutil.ChecksumSHA256), "")
-	fs.Func("size-threshold", "", wholeNumber(&o.sizeThresholdMB))
+	fs.Func("size-threshold", "", wholeNumber(&o.sizeThresholdMB, 100))
 	fs.BoolVar(&o.haltOnMissing, "halt-on-missing", false, "")
 	fs.BoolVar(&o.filenameOnly, "filename-only", false, "")
 	fs.BoolVar(&o.debug, "debug", false, "")
@@ -113,11 +113,16 @@ func newFlagSet(o *options) *flag.FlagSet {
 	return fs
 }
 
-func wholeNumber(p *int) func(string) error {
+// wholeNumber parses an option's value into p. Its error says what the option needs, such as "a
+// whole number, like 4" for an example of 4, which friendlyFlagError puts into a sentence.
+func wholeNumber(p *int, example int) func(string) error {
 	return func(s string) error {
 		n, err := strconv.Atoi(s)
+		if errors.Is(err, strconv.ErrRange) {
+			return fmt.Errorf("a smaller whole number, like %d", example)
+		}
 		if err != nil {
-			return errors.New("it must be a whole number, like 2")
+			return fmt.Errorf("a whole number, like %d", example)
 		}
 		*p = n
 		return nil
@@ -180,23 +185,61 @@ func endedWithTerminator(consumed []string) bool {
 	return probe.Parse(consumed[:n-1]) == nil && probe.NArg() == 0
 }
 
-// friendlyFlagError rewords the flag package's two most common errors, naming the option as it was
-// typed in args. They have no types to check, so their stable wording is matched instead.
+// friendlyFlagError rewords the flag package's errors, naming the option as it was typed in args.
+// They have no types to check, so their stable wording is matched instead.
 func friendlyFlagError(err error, args []string) error {
 	msg := err.Error()
 	if name, ok := strings.CutPrefix(msg, "flag provided but not defined: -"); ok {
 		typed, whole := findOption(name, args)
-		if looksLikeFolder(whole) {
-			return fmt.Errorf("there's no option called %s. If that's the folder to rebalance, put -- before it, like this: rebalance -- %s",
-				typed, shellQuote(whole))
-		}
-		return fmt.Errorf("there's no option called %s", typed)
+		return noSuchOption(typed, whole)
+	}
+	if arg, ok := strings.CutPrefix(msg, "bad flag syntax: "); ok {
+		return noSuchOption(arg, arg)
 	}
 	if name, ok := strings.CutPrefix(msg, "flag needs an argument: -"); ok {
 		typed, _ := findOption(name, args)
 		return fmt.Errorf("%s needs a value after it", typed)
 	}
+	// A number option given something else: `invalid value "abc" for flag -concurrency: a whole
+	// number, like 4`, where the last part is what wholeNumber says the option needs.
+	if rest, ok := strings.CutPrefix(msg, "invalid value "); ok {
+		if value, err := strconv.QuotedPrefix(rest); err == nil {
+			rest = strings.TrimPrefix(rest[len(value):], " for flag -")
+			if name, need, ok := strings.Cut(rest, ": "); ok {
+				typed, _ := findOption(name, args)
+				if value == `""` {
+					return fmt.Errorf("%s needs %s", typed, need)
+				}
+				return fmt.Errorf("%s needs %s, not %s", typed, need, value)
+			}
+		}
+	}
+	// An on/off option given a value it can't take, such as --resume=maybe. The flag package names
+	// it as "-resume" for a plain option and "resume" for one with its own handling.
+	for _, prefix := range []string{"invalid boolean value ", "invalid boolean flag "} {
+		rest, ok := strings.CutPrefix(msg, prefix)
+		if !ok {
+			continue
+		}
+		if value, err := strconv.QuotedPrefix(rest); err == nil {
+			rest = strings.TrimPrefix(rest[len(value):], " for ")
+		}
+		name, _, _ := strings.Cut(strings.TrimPrefix(rest, "-"), ":")
+		typed, whole := findOption(name, args)
+		return fmt.Errorf("%s is an on/off option: give it on its own, without %q", typed, strings.TrimPrefix(whole, typed))
+	}
 	return err
+}
+
+// noSuchOption is the error for an argument that looks like an option but isn't one. typed is the
+// option as it was typed and whole the whole argument; if that looks like a folder, the error says
+// how to give it.
+func noSuchOption(typed, whole string) error {
+	if looksLikeFolder(whole) {
+		return fmt.Errorf("there's no option called %s. If that's the folder to rebalance, put -- before it, like this: rebalance -- %s",
+			typed, shellQuote(whole))
+	}
+	return fmt.Errorf("there's no option called %s", typed)
 }
 
 // findOption finds the argument the flag package called name: the flag package drops the dashes
@@ -251,7 +294,7 @@ func (o *options) validate() error {
 	}
 	sum, err := fileutil.ParseChecksumType(o.checksum)
 	if err != nil {
-		return fmt.Errorf("--checksum: %w", err)
+		return fmt.Errorf("--checksum needs sha256 (the default) or md5, not %q", o.checksum)
 	}
 	o.checksumType = sum
 	return nil
